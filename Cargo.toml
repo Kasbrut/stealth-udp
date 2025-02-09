@@ -1,0 +1,11 @@
+[package]
+name = "stealth-udp"
+version = "1.0.0"
+authors = ["Kasbrut <lorenzo.caputo1998@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+pnet = "0.35.0"
+clap = "4.5.27"
+chrono = "0.4"
+ctrlc = "3.4.5"
