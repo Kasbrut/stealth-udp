@@ -1,11 +1,16 @@
 //! Command-line interface: parses arguments into a plain `Args` struct.
 
+use std::time::Duration;
+
 use clap::{Arg, Command};
 
 use crate::sink::OutputFormat;
 
 /// The default UDP port to listen on when `--port` is not provided.
 pub const DEFAULT_PORT: u16 = 12345;
+
+/// The default number of seconds between periodic flushes.
+pub const DEFAULT_FLUSH_SECS: u64 = 5;
 
 /// Command-line arguments resolved at startup.
 pub struct Args {
@@ -15,6 +20,8 @@ pub struct Args {
     pub port: u16,
     /// How captured datagrams are written out.
     pub format: OutputFormat,
+    /// How often buffered data is flushed to disk.
+    pub flush_interval: Duration,
 }
 
 /// Parses the process arguments into an [`Args`] value.
@@ -49,6 +56,13 @@ pub fn parse() -> Args {
                 .default_value("raw")
                 .help("Output format: 'raw' appends payload bytes, 'jsonl' writes one JSON object per datagram"),
         )
+        .arg(
+            Arg::new("flush-interval")
+                .long("flush-interval")
+                .value_name("SECONDS")
+                .default_value("5")
+                .help("Seconds between periodic flushes to disk (0 disables periodic flushing)"),
+        )
         .get_matches();
 
     let port_str = matches.get_one::<String>("port").unwrap();
@@ -65,9 +79,19 @@ pub fn parse() -> Args {
         _ => OutputFormat::Raw,
     };
 
+    let flush_str = matches.get_one::<String>("flush-interval").unwrap();
+    let flush_secs = flush_str.parse().unwrap_or_else(|_| {
+        eprintln!(
+            "Invalid flush interval '{}', falling back to {}",
+            flush_str, DEFAULT_FLUSH_SECS
+        );
+        DEFAULT_FLUSH_SECS
+    });
+
     Args {
         interface: matches.get_one::<String>("iface").cloned(),
         port,
         format,
+        flush_interval: Duration::from_secs(flush_secs),
     }
 }

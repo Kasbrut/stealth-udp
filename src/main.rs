@@ -8,13 +8,24 @@ use chrono::Local;
 use stealth_udp::{capture, cli, sink, sniffer};
 
 fn main() {
+    if let Err(e) = try_main() {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<(), String> {
     let args = cli::parse();
 
-    let interface = args.interface.unwrap_or_else(capture::default_interface);
+    let interface = match args.interface {
+        Some(iface) => iface,
+        None => capture::default_interface()?,
+    };
 
     let today = Local::now().format("%Y-%m-%d");
     let logs_dir = format!("{}-logs", today);
-    create_dir_all(&logs_dir).expect("Error creating the log folder");
+    create_dir_all(&logs_dir)
+        .map_err(|e| format!("Error creating the log folder '{}': {}", logs_dir, e))?;
 
     println!(
         "Listening on port {} on interface: {}",
@@ -22,5 +33,5 @@ fn main() {
     );
 
     let sink = sink::build_sink(args.format, logs_dir);
-    sniffer::run(&interface, args.port, sink);
+    sniffer::run(&interface, args.port, args.flush_interval, sink)
 }
