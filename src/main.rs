@@ -116,7 +116,7 @@ fn run_sniffer(args: Args) -> Result<(), String> {
         args.port, interface
     );
 
-    let mut sink = sink::build_sink(args.format, logs_dir);
+    let mut sink = sink::build_sink(args.format, logs_dir, args.transfer_timeout);
     if !args.keyring.is_empty() {
         println!("Decryption enabled with {} key(s).", args.keyring.len());
         sink = Box::new(sink::DecryptingSink::new(args.keyring, sink));

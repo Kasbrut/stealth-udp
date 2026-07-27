@@ -15,6 +15,7 @@ pub struct FileConfig {
     pub port: Option<u16>,
     pub format: Option<String>,
     pub flush_interval: Option<u64>,
+    pub transfer_timeout: Option<u64>,
 }
 
 /// Loads and parses the JSON config file at `path`.

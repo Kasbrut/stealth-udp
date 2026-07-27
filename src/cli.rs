@@ -17,6 +17,10 @@ pub const DEFAULT_PORT: u16 = 12345;
 /// The default number of seconds between periodic flushes.
 pub const DEFAULT_FLUSH_SECS: u64 = 5;
 
+/// The default idle timeout (seconds) before an incomplete file transfer is
+/// garbage collected. Zero disables the cleanup.
+pub const DEFAULT_TRANSFER_TIMEOUT_SECS: u64 = 300;
+
 /// What the user asked the program to do.
 pub enum Invocation {
     /// Run the sniffer.
@@ -42,6 +46,8 @@ pub struct Args {
     pub format: OutputFormat,
     /// How often buffered data is flushed to disk.
     pub flush_interval: Duration,
+    /// Idle timeout before an incomplete file transfer is dropped (file mode).
+    pub transfer_timeout: Duration,
     /// Server private keys enabling decryption; empty means "no decryption".
     pub keyring: Vec<[u8; KEY_LEN]>,
 }
@@ -85,6 +91,7 @@ pub fn parse() -> Result<Invocation, String> {
         port: resolve_port(&matches, &file_cfg),
         format: resolve_format(&matches, &file_cfg)?,
         flush_interval: Duration::from_secs(resolve_flush_secs(&matches, &file_cfg)),
+        transfer_timeout: Duration::from_secs(resolve_transfer_timeout(&matches, &file_cfg)),
         keyring,
     }))
 }
@@ -123,6 +130,13 @@ fn command() -> Command {
                 .value_name("SECONDS")
                 .default_value("5")
                 .help("Seconds between periodic flushes to disk (0 disables periodic flushing)"),
+        )
+        .arg(
+            Arg::new("transfer-timeout")
+                .long("transfer-timeout")
+                .value_name("SECONDS")
+                .default_value("300")
+                .help("Idle seconds before an incomplete file transfer is dropped (0 disables)"),
         )
         .arg(
             Arg::new("config")
@@ -206,5 +220,22 @@ fn resolve_flush_secs(matches: &ArgMatches, file_cfg: &FileConfig) -> u64 {
         })
     } else {
         file_cfg.flush_interval.unwrap_or(DEFAULT_FLUSH_SECS)
+    }
+}
+
+fn resolve_transfer_timeout(matches: &ArgMatches, file_cfg: &FileConfig) -> u64 {
+    if set_on_cli(matches, "transfer-timeout") {
+        let raw = matches.get_one::<String>("transfer-timeout").unwrap();
+        raw.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "Invalid transfer timeout '{}', falling back to {}",
+                raw, DEFAULT_TRANSFER_TIMEOUT_SECS
+            );
+            DEFAULT_TRANSFER_TIMEOUT_SECS
+        })
+    } else {
+        file_cfg
+            .transfer_timeout
+            .unwrap_or(DEFAULT_TRANSFER_TIMEOUT_SECS)
     }
 }

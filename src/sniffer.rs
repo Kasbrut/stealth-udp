@@ -101,7 +101,7 @@ fn writer_loop(
         }
     }
 
-    sink.flush();
+    sink.finish();
 }
 
 /// How long the writer waits between channel polls. When periodic flushing is

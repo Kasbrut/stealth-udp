@@ -16,8 +16,12 @@ use crate::writer::{sanitized_ip, LogWriter};
 pub trait DatagramSink {
     /// Persists a single datagram.
     fn handle(&mut self, datagram: &UdpDatagram) -> io::Result<()>;
-    /// Flushes any buffered data (called on shutdown).
+    /// Flushes buffered data; called periodically and at shutdown.
     fn flush(&mut self);
+    /// Called once at shutdown after the final flush. Defaults to a flush.
+    fn finish(&mut self) {
+        self.flush();
+    }
 }
 
 /// A decorator that decrypts each datagram's payload before forwarding it to an
@@ -63,6 +67,10 @@ impl DatagramSink for DecryptingSink {
     fn flush(&mut self) {
         self.inner.flush();
     }
+
+    fn finish(&mut self) {
+        self.inner.finish();
+    }
 }
 
 /// Selectable output format, chosen on the command line.
@@ -91,11 +99,20 @@ impl OutputFormat {
 
 /// Builds the sink matching `format`, storing files under `logs_dir`. The sink
 /// is `Send` so it can be moved onto the dedicated writer thread.
-pub fn build_sink(format: OutputFormat, logs_dir: String) -> Box<dyn DatagramSink + Send> {
+/// `transfer_timeout` bounds how long an idle incomplete file transfer is kept
+/// (file mode only); a zero duration disables that cleanup.
+pub fn build_sink(
+    format: OutputFormat,
+    logs_dir: String,
+    transfer_timeout: std::time::Duration,
+) -> Box<dyn DatagramSink + Send> {
     match format {
         OutputFormat::Raw => Box::new(RawFileSink::new(logs_dir)),
         OutputFormat::Jsonl => Box::new(JsonlSink::new(logs_dir)),
-        OutputFormat::File => Box::new(crate::reassembly::FileReassemblySink::new(logs_dir)),
+        OutputFormat::File => Box::new(crate::reassembly::FileReassemblySink::new(
+            logs_dir,
+            transfer_timeout,
+        )),
     }
 }
 

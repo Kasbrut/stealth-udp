@@ -4,16 +4,18 @@
 //!
 //! Usage:
 //!   cargo run --example send_file -- <HOST:PORT> <FILE> \
-//!       [--chunk-size N] [--server-key <HEX|FILE>]
+//!       [--chunk-size N] [--repeat N] [--passes N] [--delay MICROS] \
+//!       [--compress] [--fec N] [--server-key <HEX|FILE>]
 
 use std::path::Path;
 use std::process;
+use std::time::Duration;
 
-use stealth_udp::client::{send_file, DEFAULT_CHUNK_SIZE, DEFAULT_REPEAT};
+use stealth_udp::client::{send_file, SendOptions};
 use stealth_udp::crypto::{self, KEY_LEN};
 
-const USAGE: &str =
-    "usage: send_file <HOST:PORT> <FILE> [--chunk-size N] [--repeat N] [--server-key <HEX|FILE>]";
+const USAGE: &str = "usage: send_file <HOST:PORT> <FILE> [--chunk-size N] [--repeat N] \
+[--passes N] [--delay MICROS] [--compress] [--fec N] [--server-key <HEX|FILE>]";
 
 fn main() {
     if let Err(e) = run() {
@@ -24,24 +26,20 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut positional = Vec::new();
-    let mut chunk_size = DEFAULT_CHUNK_SIZE;
-    let mut repeat = DEFAULT_REPEAT;
-    let mut server_key = None;
+    let mut opts = SendOptions::default();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--chunk-size" => {
-                let value = args.next().ok_or("--chunk-size needs a value")?;
-                chunk_size = value.parse().map_err(|_| "--chunk-size must be a number")?;
-            }
-            "--repeat" => {
-                let value = args.next().ok_or("--repeat needs a value")?;
-                repeat = value.parse().map_err(|_| "--repeat must be a number")?;
-            }
+            "--chunk-size" => opts.chunk_size = parse_num(args.next(), "--chunk-size")?,
+            "--repeat" => opts.repeat = parse_num(args.next(), "--repeat")?,
+            "--passes" => opts.passes = parse_num(args.next(), "--passes")?,
+            "--delay" => opts.delay = Duration::from_micros(parse_num(args.next(), "--delay")?),
+            "--fec" => opts.fec_group = parse_num(args.next(), "--fec")?,
+            "--compress" => opts.compress = true,
             "--server-key" => {
                 let value = args.next().ok_or("--server-key needs a value")?;
-                server_key = Some(load_server_key(&value)?);
+                opts.server_public = Some(load_server_key(&value)?);
             }
             other => positional.push(other.to_string()),
         }
@@ -50,14 +48,14 @@ fn run() -> Result<(), String> {
     if positional.len() != 2 {
         return Err(USAGE.to_string());
     }
+    send_file(&positional[0], &positional[1], &opts)
+}
 
-    send_file(
-        &positional[0],
-        &positional[1],
-        chunk_size,
-        repeat,
-        server_key,
-    )
+fn parse_num<T: std::str::FromStr>(value: Option<String>, flag: &str) -> Result<T, String> {
+    value
+        .ok_or_else(|| format!("{} needs a value", flag))?
+        .parse()
+        .map_err(|_| format!("{} must be a number", flag))
 }
 
 /// Loads a server public key from a hex string or a file containing one.

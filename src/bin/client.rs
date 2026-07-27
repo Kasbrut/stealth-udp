@@ -5,12 +5,18 @@
 //! separate key. Run it to send a file (every packet is encrypted).
 //!
 //! Usage:
-//!   client <HOST:PORT> <FILE> [--chunk-size N]
+//!   client <HOST:PORT> <FILE> [--chunk-size N] [--repeat N] [--passes N]
+//!          [--delay MICROS] [--compress] [--fec N]
 //!   client --show-key            # print the embedded public key, then exit
 
-use stealth_udp::client::{send_file, DEFAULT_CHUNK_SIZE, DEFAULT_REPEAT};
+use std::time::Duration;
+
+use stealth_udp::client::{send_file, SendOptions};
 use stealth_udp::crypto::to_hex;
 use stealth_udp::embed::{self, SLOT_LEN};
+
+const USAGE: &str = "usage: client <HOST:PORT> <FILE> [--chunk-size N] [--repeat N] \
+[--passes N] [--delay MICROS] [--compress] [--fec N]  |  client --show-key";
 
 /// The key slot. Non-zero marker keeps it in the file image; the server patches
 /// the placeholder that follows the marker.
@@ -37,10 +43,8 @@ fn main() {
 fn run() -> Result<(), String> {
     let key = embed::read_embedded(&embedded_slot());
 
-    let mut args = std::env::args().skip(1);
-    let first = args
-        .next()
-        .ok_or("usage: client <HOST:PORT> <FILE> [--chunk-size N]  |  client --show-key")?;
+    let mut args = std::env::args().skip(1).peekable();
+    let first = args.next().ok_or(USAGE)?;
 
     if first == "--show-key" {
         let key = key.ok_or("this client has no embedded key (not provisioned)")?;
@@ -49,27 +53,30 @@ fn run() -> Result<(), String> {
     }
 
     let target = first;
-    let path = args
-        .next()
-        .ok_or("usage: client <HOST:PORT> <FILE> [--chunk-size N] [--repeat N]")?;
+    let path = args.next().ok_or(USAGE)?;
 
-    let mut chunk_size = DEFAULT_CHUNK_SIZE;
-    let mut repeat = DEFAULT_REPEAT;
+    let mut opts = SendOptions::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--chunk-size" => {
-                let value = args.next().ok_or("--chunk-size needs a value")?;
-                chunk_size = value.parse().map_err(|_| "--chunk-size must be a number")?;
-            }
-            "--repeat" => {
-                let value = args.next().ok_or("--repeat needs a value")?;
-                repeat = value.parse().map_err(|_| "--repeat must be a number")?;
-            }
+            "--chunk-size" => opts.chunk_size = parse_num(args.next(), "--chunk-size")?,
+            "--repeat" => opts.repeat = parse_num(args.next(), "--repeat")?,
+            "--passes" => opts.passes = parse_num(args.next(), "--passes")?,
+            "--delay" => opts.delay = Duration::from_micros(parse_num(args.next(), "--delay")?),
+            "--fec" => opts.fec_group = parse_num(args.next(), "--fec")?,
+            "--compress" => opts.compress = true,
             other => return Err(format!("unexpected argument: {}", other)),
         }
     }
 
-    let key =
+    let embedded =
         key.ok_or("this client has no embedded server key; provision it with --gen-client")?;
-    send_file(&target, &path, chunk_size, repeat, Some(key))
+    opts.server_public = Some(embedded);
+    send_file(&target, &path, &opts)
+}
+
+fn parse_num<T: std::str::FromStr>(value: Option<String>, flag: &str) -> Result<T, String> {
+    value
+        .ok_or_else(|| format!("{} needs a value", flag))?
+        .parse()
+        .map_err(|_| format!("{} must be a number", flag))
 }
