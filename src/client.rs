@@ -14,21 +14,29 @@ use crate::protocol::{encode_data, encode_meta, MetaPacket};
 /// fragmentation.
 pub const DEFAULT_CHUNK_SIZE: usize = 1400;
 
+/// Default number of times each packet is sent. Since the channel is one-way
+/// (no retransmission), sending twice cheaply mitigates isolated loss; the
+/// server ignores the duplicates.
+pub const DEFAULT_REPEAT: usize = 2;
+
 /// Resend META every this many data packets so its loss is recoverable on an
 /// unstable link.
 const META_RESEND_EVERY: usize = 50;
 
-/// Sends `path` to `target` in chunks of `chunk_size` bytes. When
-/// `server_public` is set, every packet is sealed to that key.
+/// Sends `path` to `target` in chunks of `chunk_size` bytes, transmitting each
+/// packet `repeat` times for loss resilience. When `server_public` is set,
+/// every packet is sealed to that key.
 pub fn send_file(
     target: &str,
     path: &str,
     chunk_size: usize,
+    repeat: usize,
     server_public: Option<[u8; KEY_LEN]>,
 ) -> Result<(), String> {
     if chunk_size == 0 {
         return Err("chunk size must be greater than zero".to_string());
     }
+    let repeat = repeat.max(1);
 
     let data = std::fs::read(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
     let filename = Path::new(path)
@@ -41,15 +49,20 @@ pub fn send_file(
         .connect(target)
         .map_err(|e| format!("cannot connect to '{}': {}", target, e))?;
 
+    // Sends `bytes` `repeat` times; each copy is sealed independently when
+    // encryption is enabled. The server deduplicates by sequence number.
     let send = |bytes: &[u8]| -> Result<(), String> {
-        let packet = match &server_public {
-            Some(key) => crypto::seal(bytes, key),
-            None => bytes.to_vec(),
-        };
-        socket
-            .send(&packet)
-            .map(|_| ())
-            .map_err(|e| format!("send failed: {}", e))
+        for _ in 0..repeat {
+            let packet = match &server_public {
+                Some(key) => crypto::seal(bytes, key),
+                None => bytes.to_vec(),
+            };
+            socket
+                .send(&packet)
+                .map(|_| ())
+                .map_err(|e| format!("send failed: {}", e))?;
+        }
+        Ok(())
     };
 
     let transfer_id = std::process::id();
@@ -76,11 +89,12 @@ pub fn send_file(
     send(&meta_bytes)?;
 
     println!(
-        "Sent '{}' ({} bytes) as transfer {} in {} chunk(s){}.",
+        "Sent '{}' ({} bytes) as transfer {} in {} chunk(s) x{}{}.",
         meta.filename,
         meta.file_size,
         transfer_id,
         sent,
+        repeat,
         if server_public.is_some() {
             " [encrypted]"
         } else {

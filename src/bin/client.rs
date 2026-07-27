@@ -8,7 +8,7 @@
 //!   client <HOST:PORT> <FILE> [--chunk-size N]
 //!   client --show-key            # print the embedded public key, then exit
 
-use stealth_udp::client::{send_file, DEFAULT_CHUNK_SIZE};
+use stealth_udp::client::{send_file, DEFAULT_CHUNK_SIZE, DEFAULT_REPEAT};
 use stealth_udp::crypto::to_hex;
 use stealth_udp::embed::{self, SLOT_LEN};
 
@@ -51,14 +51,19 @@ fn run() -> Result<(), String> {
     let target = first;
     let path = args
         .next()
-        .ok_or("usage: client <HOST:PORT> <FILE> [--chunk-size N]")?;
+        .ok_or("usage: client <HOST:PORT> <FILE> [--chunk-size N] [--repeat N]")?;
 
     let mut chunk_size = DEFAULT_CHUNK_SIZE;
+    let mut repeat = DEFAULT_REPEAT;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--chunk-size" => {
                 let value = args.next().ok_or("--chunk-size needs a value")?;
                 chunk_size = value.parse().map_err(|_| "--chunk-size must be a number")?;
+            }
+            "--repeat" => {
+                let value = args.next().ok_or("--repeat needs a value")?;
+                repeat = value.parse().map_err(|_| "--repeat must be a number")?;
             }
             other => return Err(format!("unexpected argument: {}", other)),
         }
@@ -66,5 +71,5 @@ fn run() -> Result<(), String> {
 
     let key =
         key.ok_or("this client has no embedded server key; provision it with --gen-client")?;
-    send_file(&target, &path, chunk_size, Some(key))
+    send_file(&target, &path, chunk_size, repeat, Some(key))
 }
