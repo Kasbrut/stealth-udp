@@ -47,8 +47,31 @@ Capturing needs libpcap at build/runtime:
 
 ## Building
 
+Build the server and the client template in release mode:
+
 ```bash
 cargo build --release
+```
+
+This produces two binaries in `target/release/`:
+
+- `stealth-udp` — the server/sniffer
+- `client` — the client template used by the single-file client workflow (see
+  below); for ad-hoc sending you can also use the `send_file` example
+
+Run the checks:
+
+```bash
+cargo test                                   # unit + integration tests (no root)
+cargo clippy --all-targets -- -D warnings    # lints
+cargo fmt --check                            # formatting
+```
+
+To build just one binary:
+
+```bash
+cargo build --release --bin stealth-udp
+cargo build --release --bin client
 ```
 
 ## Options
@@ -97,6 +120,10 @@ Run the server with `--format file`, then use the example client:
 ```bash
 cargo run --example send_file -- <HOST:PORT> ./some-file.bin
 ```
+
+Because the channel is one-way (no retransmission), the client sends each
+packet more than once for loss resilience — `--repeat N` (default 2). The server
+ignores the duplicates. `--chunk-size N` tunes the payload size per packet.
 
 ### Encryption (optional)
 
