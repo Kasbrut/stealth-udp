@@ -8,6 +8,7 @@
 pub mod capture;
 pub mod cli;
 pub mod config;
+pub mod crypto;
 pub mod parser;
 pub mod protocol;
 pub mod reassembly;
