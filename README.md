@@ -98,6 +98,32 @@ Run the server with `--format file`, then use the example client:
 cargo run --example send_file -- <HOST:PORT> ./some-file.bin
 ```
 
+### Encryption (optional)
+
+Traffic can be end-to-end encrypted so a passive observer cannot read it. It
+uses sealed boxes (X25519 + XChaCha20-Poly1305): the client encrypts to the
+server's public key with a fresh ephemeral key per message (forward secrecy),
+and no handshake is needed — a good fit for the one-way channel.
+
+Each client gets its own server-side key pair, so clients share nothing and any
+client can be revoked by removing its key from the keyring.
+
+```bash
+# 1. On the server: create a client key pair (appends the private key to the
+#    keyring, prints the public key to give to that client).
+./stealth-udp --gen-client alice --keyring server.keys
+
+# 2. Run the server with decryption enabled.
+sudo ./stealth-udp --keyring server.keys -f file
+
+# 3. On the client: encrypt using the printed public key.
+cargo run --example send_file -- <HOST:PORT> ./secret.bin --server-key <PUBLIC_HEX>
+```
+
+Note: this provides confidentiality, not sender authentication — the public key
+is not a secret, so anyone who has it can send. Authenticating *which* client
+sent would require per-client signing keys (a possible future addition).
+
 ## Running with administrator permissions
 
 Capturing at the data-link layer requires elevated privileges:
