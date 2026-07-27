@@ -15,7 +15,7 @@ fn main() {
 }
 
 fn try_main() -> Result<(), String> {
-    let args = cli::parse();
+    let args = cli::parse()?;
 
     let interface = match args.interface {
         Some(iface) => iface,

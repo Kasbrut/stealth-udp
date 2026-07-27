@@ -1,12 +1,15 @@
-//! Command-line interface: parses arguments into a plain `Args` struct.
+//! Command-line interface: parses arguments (and an optional JSON config file)
+//! into a plain `Args` struct. Precedence: CLI flag > config file > default.
 
 use std::time::Duration;
 
-use clap::{Arg, Command};
+use clap::parser::ValueSource;
+use clap::{Arg, ArgMatches, Command};
 
+use crate::config::{self, FileConfig};
 use crate::sink::OutputFormat;
 
-/// The default UDP port to listen on when `--port` is not provided.
+/// The default UDP port to listen on when nothing else is provided.
 pub const DEFAULT_PORT: u16 = 12345;
 
 /// The default number of seconds between periodic flushes.
@@ -24,12 +27,25 @@ pub struct Args {
     pub flush_interval: Duration,
 }
 
-/// Parses the process arguments into an [`Args`] value.
-///
-/// An invalid `--port` value is reported and falls back to [`DEFAULT_PORT`]
-/// rather than aborting the program.
-pub fn parse() -> Args {
-    let matches = Command::new("UDP Packet Sniffer")
+/// Parses the process arguments (merged with the config file) into [`Args`].
+pub fn parse() -> Result<Args, String> {
+    let matches = command().get_matches();
+
+    let file_cfg = match matches.get_one::<String>("config") {
+        Some(path) => config::load(path)?,
+        None => FileConfig::default(),
+    };
+
+    Ok(Args {
+        interface: resolve_interface(&matches, &file_cfg),
+        port: resolve_port(&matches, &file_cfg),
+        format: resolve_format(&matches, &file_cfg)?,
+        flush_interval: Duration::from_secs(resolve_flush_secs(&matches, &file_cfg)),
+    })
+}
+
+fn command() -> Command {
+    Command::new("UDP Packet Sniffer")
         .version(env!("CARGO_PKG_VERSION"))
         .about("UDP Packet Sniffer")
         .arg(
@@ -63,36 +79,63 @@ pub fn parse() -> Args {
                 .default_value("5")
                 .help("Seconds between periodic flushes to disk (0 disables periodic flushing)"),
         )
-        .get_matches();
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("FILE")
+                .help("Path to a JSON config file (CLI flags override its values)"),
+        )
+}
 
-    let port_str = matches.get_one::<String>("port").unwrap();
-    let port = port_str.parse().unwrap_or_else(|_| {
-        eprintln!(
-            "Invalid port '{}', falling back to {}",
-            port_str, DEFAULT_PORT
-        );
-        DEFAULT_PORT
-    });
+/// Whether an argument's value came from the command line (rather than its
+/// default), i.e. the user explicitly passed it.
+fn set_on_cli(matches: &ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
+}
 
-    let format = match matches.get_one::<String>("format").unwrap().as_str() {
-        "jsonl" => OutputFormat::Jsonl,
-        "file" => OutputFormat::File,
-        _ => OutputFormat::Raw,
-    };
+fn resolve_interface(matches: &ArgMatches, file_cfg: &FileConfig) -> Option<String> {
+    matches
+        .get_one::<String>("iface")
+        .cloned()
+        .or_else(|| file_cfg.interface.clone())
+}
 
-    let flush_str = matches.get_one::<String>("flush-interval").unwrap();
-    let flush_secs = flush_str.parse().unwrap_or_else(|_| {
-        eprintln!(
-            "Invalid flush interval '{}', falling back to {}",
-            flush_str, DEFAULT_FLUSH_SECS
-        );
-        DEFAULT_FLUSH_SECS
-    });
+fn resolve_port(matches: &ArgMatches, file_cfg: &FileConfig) -> u16 {
+    if set_on_cli(matches, "port") {
+        let raw = matches.get_one::<String>("port").unwrap();
+        raw.parse().unwrap_or_else(|_| {
+            eprintln!("Invalid port '{}', falling back to {}", raw, DEFAULT_PORT);
+            DEFAULT_PORT
+        })
+    } else {
+        file_cfg.port.unwrap_or(DEFAULT_PORT)
+    }
+}
 
-    Args {
-        interface: matches.get_one::<String>("iface").cloned(),
-        port,
-        format,
-        flush_interval: Duration::from_secs(flush_secs),
+fn resolve_format(matches: &ArgMatches, file_cfg: &FileConfig) -> Result<OutputFormat, String> {
+    if set_on_cli(matches, "format") {
+        // The CLI value_parser guarantees a known name here.
+        Ok(OutputFormat::from_name(matches.get_one::<String>("format").unwrap()).unwrap())
+    } else if let Some(name) = file_cfg.format.as_deref() {
+        OutputFormat::from_name(name)
+            .ok_or_else(|| format!("Invalid 'format' in config file: '{}'", name))
+    } else {
+        Ok(OutputFormat::Raw)
+    }
+}
+
+fn resolve_flush_secs(matches: &ArgMatches, file_cfg: &FileConfig) -> u64 {
+    if set_on_cli(matches, "flush-interval") {
+        let raw = matches.get_one::<String>("flush-interval").unwrap();
+        raw.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "Invalid flush interval '{}', falling back to {}",
+                raw, DEFAULT_FLUSH_SECS
+            );
+            DEFAULT_FLUSH_SECS
+        })
+    } else {
+        file_cfg.flush_interval.unwrap_or(DEFAULT_FLUSH_SECS)
     }
 }

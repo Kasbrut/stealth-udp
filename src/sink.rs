@@ -29,6 +29,19 @@ pub enum OutputFormat {
     File,
 }
 
+impl OutputFormat {
+    /// Maps a format name (as used on the CLI and in the config file) to a
+    /// variant, or `None` if the name is unknown.
+    pub fn from_name(name: &str) -> Option<OutputFormat> {
+        match name {
+            "raw" => Some(OutputFormat::Raw),
+            "jsonl" => Some(OutputFormat::Jsonl),
+            "file" => Some(OutputFormat::File),
+            _ => None,
+        }
+    }
+}
+
 /// Builds the sink matching `format`, storing files under `logs_dir`. The sink
 /// is `Send` so it can be moved onto the dedicated writer thread.
 pub fn build_sink(format: OutputFormat, logs_dir: String) -> Box<dyn DatagramSink + Send> {
