@@ -9,3 +9,6 @@ pnet = "0.35.0"
 clap = "4.5.27"
 chrono = "0.4"
 ctrlc = "3.4.5"
+
+[dev-dependencies]
+tempfile = "3"
