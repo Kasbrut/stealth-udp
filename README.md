@@ -124,6 +124,31 @@ Note: this provides confidentiality, not sender authentication — the public ke
 is not a secret, so anyone who has it can send. Authenticating *which* client
 sent would require per-client signing keys (a possible future addition).
 
+### Single-file client (embedded key)
+
+Instead of shipping a client binary plus a key file, the server can bake a
+client's public key directly into a pre-compiled client binary, so each user
+gets one self-contained file. The template is built once; provisioning patches
+a copy — no recompilation.
+
+```bash
+# Build the client template once.
+cargo build --release --bin client
+
+# Provision a client: generates the key pair, stores the private key in the
+# keyring, and writes a ready-to-run client with the public key embedded.
+./stealth-udp --gen-client alice --keyring server.keys \
+    --client-template target/release/client --client-out client-alice
+
+# The provisioned client needs no key argument:
+./client-alice <HOST:PORT> ./secret.bin
+./client-alice --show-key          # inspect the embedded public key
+```
+
+Notes: the provisioned binary is specific to the template's OS/architecture.
+On macOS the patched binary is re-signed ad-hoc automatically (patching
+invalidates the signature, which is fatal on Apple Silicon).
+
 ## Running with administrator permissions
 
 Capturing at the data-link layer requires elevated privileges:
