@@ -2,16 +2,13 @@
 //! thread persists them through the sink. Splitting the two means slow disk
 //! I/O never blocks packet capture (a bounded channel applies backpressure).
 
-use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use pnet::datalink::DataLinkReceiver;
-
-use crate::capture;
+use crate::capture::{self, Capturer};
 use crate::parser::{extract_udp_datagram, UdpDatagram};
 use crate::sink::DatagramSink;
 
@@ -30,7 +27,7 @@ pub fn run(
     flush_interval: Duration,
     sink: Box<dyn DatagramSink + Send>,
 ) -> Result<(), String> {
-    let rx = capture::open_channel(interface)?;
+    let capturer = capture::open(interface, port)?;
 
     let running = Arc::new(AtomicBool::new(true));
     install_signal_handler(running.clone())?;
@@ -41,7 +38,7 @@ pub fn run(
     let writer = thread::spawn(move || writer_loop(sink, rx_chan, flush_interval));
 
     // The capture loop runs on this thread and feeds the channel.
-    capture_loop(rx, port, &tx, &running);
+    capture_loop(capturer, port, &tx, &running);
 
     // Closing the channel lets the writer thread finish its final flush.
     drop(tx);
@@ -53,14 +50,14 @@ pub fn run(
 /// Reads and parses frames until interrupted, forwarding matching datagrams to
 /// the writer thread.
 fn capture_loop(
-    mut rx: Box<dyn DataLinkReceiver>,
+    mut capturer: Capturer,
     port: u16,
     tx: &SyncSender<UdpDatagram>,
     running: &AtomicBool,
 ) {
     while running.load(Ordering::SeqCst) {
-        match rx.next() {
-            Ok(frame) => {
+        match capturer.next_frame() {
+            Ok(Some(frame)) => {
                 if let Some(datagram) = extract_udp_datagram(frame, port) {
                     // A send error means the writer thread is gone: stop.
                     if tx.send(datagram).is_err() {
@@ -68,10 +65,10 @@ fn capture_loop(
                     }
                 }
             }
-            // A timed-out or would-block read just means "no packet yet": loop
-            // back and re-check the running flag.
-            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => continue,
-            Err(e) => eprintln!("Error reading packet: {}", e),
+            // A read timeout just means "no packet yet": loop back and
+            // re-check the running flag.
+            Ok(None) => continue,
+            Err(e) => eprintln!("{}", e),
         }
     }
 }

@@ -29,7 +29,18 @@ network interface:
 | `main.rs`      | Thin entry point that wires everything together       |
 
 Capture and disk writing run on separate threads connected by a bounded
-channel, so slow disk I/O never blocks packet capture.
+channel, so slow disk I/O never blocks packet capture. Capture goes through
+libpcap (the `pcap` crate), which pushes a kernel BPF filter so only UDP
+datagrams for the chosen port reach userspace; the interface is opened in
+non-promiscuous mode.
+
+## Requirements
+
+Capturing needs libpcap at build/runtime:
+
+- **Linux:** `libpcap` + `libpcap-dev` (e.g. `sudo apt-get install libpcap-dev`)
+- **macOS:** ships with the OS, nothing to install
+- **Windows:** install [Npcap](https://npcap.com/)
 
 ## Building
 
