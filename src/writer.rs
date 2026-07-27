@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 /// Keeps one buffered, append-only file per name and appends bytes to the
 /// requested file, opening it on first use.
@@ -48,9 +48,11 @@ impl LogWriter {
     }
 }
 
-/// Filesystem-safe form of an IPv4 address: `192.168.1.10` -> `192_168_1_10`.
-pub fn sanitized_ip(source: &Ipv4Addr) -> String {
-    source.to_string().replace('.', "_")
+/// Filesystem-safe form of an IP address, replacing the separators that are
+/// invalid in file names on common filesystems:
+/// `192.168.1.10` -> `192_168_1_10`, `fe80::1` -> `fe80__1`.
+pub fn sanitized_ip(source: &IpAddr) -> String {
+    source.to_string().replace(['.', ':'], "_")
 }
 
 #[cfg(test)]
@@ -59,11 +61,15 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn sanitized_ip_replaces_dots() {
-        assert_eq!(
-            sanitized_ip(&Ipv4Addr::new(192, 168, 1, 10)),
-            "192_168_1_10"
-        );
+    fn sanitized_ip_replaces_ipv4_dots() {
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10));
+        assert_eq!(sanitized_ip(&ip), "192_168_1_10");
+    }
+
+    #[test]
+    fn sanitized_ip_replaces_ipv6_colons() {
+        let ip = IpAddr::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert_eq!(sanitized_ip(&ip), "fe80__1");
     }
 
     #[test]

@@ -117,11 +117,11 @@ fn json_line(datagram: &UdpDatagram, timestamp: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::Value;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn datagram(payload: &[u8]) -> UdpDatagram {
         UdpDatagram {
-            source: Ipv4Addr::new(10, 0, 0, 5),
+            source: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
             payload: payload.to_vec(),
         }
     }
