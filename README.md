@@ -20,11 +20,14 @@ network interface:
 
 | Module         | Responsibility                                        |
 |----------------|-------------------------------------------------------|
-| `cli.rs`       | Parse command-line arguments into `Args`              |
-| `capture.rs`   | Select the interface and open the data-link channel   |
+| `cli.rs`       | Parse arguments + optional JSON config into `Args`    |
+| `config.rs`    | Optional JSON config file                             |
+| `capture.rs`   | Select the interface and open the libpcap channel     |
 | `parser.rs`    | Pure parsing of Ethernet/IPv4/IPv6 UDP frames         |
+| `protocol.rs`  | Chunked file-transfer wire protocol (parse + encode)  |
 | `writer.rs`    | Per-IP buffered, append-only file management          |
-| `sink.rs`      | Pluggable output formats (`raw`, `jsonl`)             |
+| `sink.rs`      | Pluggable output formats (`raw`, `jsonl`, `file`)     |
+| `reassembly.rs`| File reassembly from numbered chunks                  |
 | `sniffer.rs`   | Capture/writer threads and shutdown handling          |
 | `main.rs`      | Thin entry point that wires everything together       |
 
@@ -58,19 +61,42 @@ cargo build --release
 |----------------------------|------------------------------------------------------------------------|
 | `-i, --iface <INTERFACE>`  | Network interface to sniff (defaults to the first active, non-loopback)|
 | `-p, --port <PORT>`        | UDP destination port to capture (default `12345`)                      |
-| `-f, --format <FORMAT>`    | `raw` (append payload bytes) or `jsonl` (one JSON object per datagram)  |
+| `-f, --format <FORMAT>`    | `raw`, `jsonl` or `file` (see below; default `raw`)                    |
 | `--flush-interval <SECS>`  | Seconds between periodic flushes to disk (`0` disables; default `5`)    |
+| `-c, --config <FILE>`      | JSON config file; CLI flags override its values                        |
 
 ### Output formats
 
-- **`raw`** — appends each datagram's payload bytes to `IP.log`. Suited to
-  reconstructing a file streamed by a client across multiple packets (payloads
-  are concatenated in arrival order).
+- **`raw`** — appends each datagram's payload bytes to `IP.log`. A quick way to
+  capture a stream when packet order is already guaranteed.
 - **`jsonl`** — writes one JSON object per datagram to `IP.jsonl`, each with a
   timestamp, source, length and both a UTF-8 and a hex view of the payload.
   Suited to discrete messages.
+- **`file`** — reassembles files streamed with the chunked transfer protocol
+  (`protocol.rs`). The client announces a file (name, size, chunk size) and
+  sends numbered chunks; the server places each chunk at its offset, so it
+  tolerates reordering, duplication and loss. Completed files land in
+  `logs/<IP>/<name>`; incomplete ones keep a `.part` file and the missing
+  chunks are logged on shutdown. See the `send_file` example for a client.
 
 Both IPv4 and IPv6 sources are supported.
+
+### Config file
+
+```json
+{ "interface": "en0", "port": 12345, "format": "file", "flush_interval": 5 }
+```
+
+Run with `--config path/to/config.json`. Any value also passed on the command
+line takes precedence over the file.
+
+### Sending a file (reassembly mode)
+
+Run the server with `--format file`, then use the example client:
+
+```bash
+cargo run --example send_file -- <HOST:PORT> ./some-file.bin
+```
 
 ## Running with administrator permissions
 
