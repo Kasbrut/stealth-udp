@@ -2,6 +2,8 @@
 
 use clap::{Arg, Command};
 
+use crate::sink::OutputFormat;
+
 /// The default UDP port to listen on when `--port` is not provided.
 pub const DEFAULT_PORT: u16 = 12345;
 
@@ -11,6 +13,8 @@ pub struct Args {
     pub interface: Option<String>,
     /// UDP destination port to capture.
     pub port: u16,
+    /// How captured datagrams are written out.
+    pub format: OutputFormat,
 }
 
 /// Parses the process arguments into an [`Args`] value.
@@ -36,6 +40,15 @@ pub fn parse() -> Args {
                 .default_value("12345")
                 .help("Specify the network port"),
         )
+        .arg(
+            Arg::new("format")
+                .short('f')
+                .long("format")
+                .value_name("FORMAT")
+                .value_parser(["raw", "jsonl"])
+                .default_value("raw")
+                .help("Output format: 'raw' appends payload bytes, 'jsonl' writes one JSON object per datagram"),
+        )
         .get_matches();
 
     let port_str = matches.get_one::<String>("port").unwrap();
@@ -47,8 +60,14 @@ pub fn parse() -> Args {
         DEFAULT_PORT
     });
 
+    let format = match matches.get_one::<String>("format").unwrap().as_str() {
+        "jsonl" => OutputFormat::Jsonl,
+        _ => OutputFormat::Raw,
+    };
+
     Args {
         interface: matches.get_one::<String>("iface").cloned(),
         port,
+        format,
     }
 }

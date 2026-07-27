@@ -5,7 +5,7 @@ use std::fs::create_dir_all;
 
 use chrono::Local;
 
-use stealth_udp::{capture, cli, sniffer};
+use stealth_udp::{capture, cli, sink, sniffer};
 
 fn main() {
     let args = cli::parse();
@@ -21,5 +21,6 @@ fn main() {
         args.port, interface
     );
 
-    sniffer::run(&interface, args.port, logs_dir);
+    let sink = sink::build_sink(args.format, logs_dir);
+    sniffer::run(&interface, args.port, sink);
 }
