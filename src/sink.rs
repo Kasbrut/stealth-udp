@@ -25,6 +25,8 @@ pub enum OutputFormat {
     Raw,
     /// Write one JSON object per datagram to a per-IP `.jsonl` file.
     Jsonl,
+    /// Reassemble files streamed with the chunked transfer protocol.
+    File,
 }
 
 /// Builds the sink matching `format`, storing files under `logs_dir`. The sink
@@ -33,6 +35,7 @@ pub fn build_sink(format: OutputFormat, logs_dir: String) -> Box<dyn DatagramSin
     match format {
         OutputFormat::Raw => Box::new(RawFileSink::new(logs_dir)),
         OutputFormat::Jsonl => Box::new(JsonlSink::new(logs_dir)),
+        OutputFormat::File => Box::new(crate::reassembly::FileReassemblySink::new(logs_dir)),
     }
 }
 

@@ -52,9 +52,9 @@ pub fn parse() -> Args {
                 .short('f')
                 .long("format")
                 .value_name("FORMAT")
-                .value_parser(["raw", "jsonl"])
+                .value_parser(["raw", "jsonl", "file"])
                 .default_value("raw")
-                .help("Output format: 'raw' appends payload bytes, 'jsonl' writes one JSON object per datagram"),
+                .help("Output format: 'raw' appends payload bytes, 'jsonl' writes one JSON object per datagram, 'file' reassembles chunked file transfers"),
         )
         .arg(
             Arg::new("flush-interval")
@@ -76,6 +76,7 @@ pub fn parse() -> Args {
 
     let format = match matches.get_one::<String>("format").unwrap().as_str() {
         "jsonl" => OutputFormat::Jsonl,
+        "file" => OutputFormat::File,
         _ => OutputFormat::Raw,
     };
 
