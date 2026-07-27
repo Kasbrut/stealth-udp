@@ -86,6 +86,7 @@ cargo build --release --bin client
 | `-p, --port <PORT>`        | UDP destination port to capture (default `12345`)                      |
 | `-f, --format <FORMAT>`    | `raw`, `jsonl` or `file` (see below; default `raw`)                    |
 | `--flush-interval <SECS>`  | Seconds between periodic flushes to disk (`0` disables; default `5`)    |
+| `--transfer-timeout <SECS>`| Idle seconds before an incomplete file transfer is dropped (`0` disables; default `300`) |
 | `-c, --config <FILE>`      | JSON config file; CLI flags override its values                        |
 
 ### Output formats
@@ -121,9 +122,28 @@ Run the server with `--format file`, then use the example client:
 cargo run --example send_file -- <HOST:PORT> ./some-file.bin
 ```
 
-Because the channel is one-way (no retransmission), the client sends each
-packet more than once for loss resilience — `--repeat N` (default 2). The server
-ignores the duplicates. `--chunk-size N` tunes the payload size per packet.
+Because the channel is one-way (no retransmission), the client has several
+knobs to survive loss and verify the result:
+
+| Client option      | Effect                                                                 |
+|--------------------|------------------------------------------------------------------------|
+| `--chunk-size N`   | Payload bytes per packet (default 1400)                                |
+| `--repeat N`       | Send each packet N times back-to-back (default 2)                      |
+| `--passes N`       | Send the whole file N times; spaced passes resist *burst* loss better  |
+| `--delay MICROS`   | Pause after each send (pacing) to avoid overrunning buffers            |
+| `--fec N`          | Emit one XOR parity packet per N chunks; the server rebuilds a single lost chunk per group |
+| `--compress`       | DEFLATE-compress the file before sending (fewer packets on the wire)   |
+
+Every transfer also carries a SHA-256 of the original file; the server verifies
+it on completion and, on mismatch, keeps the `.part` instead of writing the
+final file. Idle incomplete transfers are dropped after `--transfer-timeout`
+(server side), keeping their `.part`.
+
+Example — compressed, with FEC and three passes:
+
+```bash
+cargo run --example send_file -- <HOST:PORT> ./big.bin --compress --fec 8 --passes 3
+```
 
 ### Encryption (optional)
 
