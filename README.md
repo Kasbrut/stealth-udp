@@ -217,3 +217,6 @@ cargo test                                   # unit tests (no root needed)
 cargo clippy --all-targets -- -D warnings    # lints
 cargo fmt --check                            # formatting
 ```
+
+See [TESTING.md](TESTING.md) for a step-by-step manual test protocol covering
+every option end-to-end.
