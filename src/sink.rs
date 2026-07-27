@@ -27,8 +27,9 @@ pub enum OutputFormat {
     Jsonl,
 }
 
-/// Builds the sink matching `format`, storing files under `logs_dir`.
-pub fn build_sink(format: OutputFormat, logs_dir: String) -> Box<dyn DatagramSink> {
+/// Builds the sink matching `format`, storing files under `logs_dir`. The sink
+/// is `Send` so it can be moved onto the dedicated writer thread.
+pub fn build_sink(format: OutputFormat, logs_dir: String) -> Box<dyn DatagramSink + Send> {
     match format {
         OutputFormat::Raw => Box::new(RawFileSink::new(logs_dir)),
         OutputFormat::Jsonl => Box::new(JsonlSink::new(logs_dir)),
