@@ -7,8 +7,10 @@
 
 pub mod capture;
 pub mod cli;
+pub mod client;
 pub mod config;
 pub mod crypto;
+pub mod embed;
 pub mod keyring;
 pub mod parser;
 pub mod protocol;

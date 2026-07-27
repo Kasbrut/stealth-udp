@@ -22,7 +22,14 @@ pub enum Invocation {
     /// Run the sniffer.
     Run(Args),
     /// Generate a new client key pair and append its private key to a keyring.
-    GenClient { name: String, keyring_path: String },
+    GenClient {
+        name: String,
+        keyring_path: String,
+        /// When both are set, patch this client template into a provisioned
+        /// single-file client binary.
+        client_template: Option<String>,
+        client_out: Option<String>,
+    },
 }
 
 /// Command-line arguments resolved at startup.
@@ -50,9 +57,16 @@ pub fn parse() -> Result<Invocation, String> {
             .get_one::<String>("keyring")
             .ok_or("--gen-client requires --keyring <FILE>")?
             .clone();
+        let client_template = matches.get_one::<String>("client-template").cloned();
+        let client_out = matches.get_one::<String>("client-out").cloned();
+        if client_template.is_some() != client_out.is_some() {
+            return Err("--client-template and --client-out must be used together".to_string());
+        }
         return Ok(Invocation::GenClient {
             name: name.clone(),
             keyring_path,
+            client_template,
+            client_out,
         });
     }
 
@@ -128,6 +142,18 @@ fn command() -> Command {
                 .long("gen-client")
                 .value_name("NAME")
                 .help("Generate a client key pair, append its private key to --keyring, and print its public key"),
+        )
+        .arg(
+            Arg::new("client-template")
+                .long("client-template")
+                .value_name("FILE")
+                .help("With --gen-client: an unprovisioned client binary to patch with the public key"),
+        )
+        .arg(
+            Arg::new("client-out")
+                .long("client-out")
+                .value_name("FILE")
+                .help("With --gen-client and --client-template: where to write the provisioned client binary"),
         )
 }
 
