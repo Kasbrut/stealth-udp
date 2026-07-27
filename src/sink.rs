@@ -2,11 +2,13 @@
 //! datagram is persisted. New output formats are added by implementing
 //! [`DatagramSink`] and wiring them into [`build_sink`].
 
+use std::collections::HashMap;
 use std::io;
 
 use chrono::Local;
 use serde::Serialize;
 
+use crate::crypto;
 use crate::parser::UdpDatagram;
 use crate::writer::{sanitized_ip, LogWriter};
 
@@ -16,6 +18,51 @@ pub trait DatagramSink {
     fn handle(&mut self, datagram: &UdpDatagram) -> io::Result<()>;
     /// Flushes any buffered data (called on shutdown).
     fn flush(&mut self);
+}
+
+/// A decorator that decrypts each datagram's payload before forwarding it to an
+/// inner sink. Datagrams not addressed to any held key, or that fail
+/// authentication, are dropped.
+pub struct DecryptingSink {
+    /// Recipient key id -> private key, for O(1) routing.
+    keys: HashMap<[u8; 4], [u8; crypto::KEY_LEN]>,
+    inner: Box<dyn DatagramSink + Send>,
+}
+
+impl DecryptingSink {
+    /// Wraps `inner`, decrypting with any of the given private keys.
+    pub fn new(
+        private_keys: Vec<[u8; crypto::KEY_LEN]>,
+        inner: Box<dyn DatagramSink + Send>,
+    ) -> Self {
+        let keys = private_keys
+            .into_iter()
+            .map(|k| (crypto::key_id(&crypto::public_from_private(&k)), k))
+            .collect();
+        Self { keys, inner }
+    }
+}
+
+impl DatagramSink for DecryptingSink {
+    fn handle(&mut self, datagram: &UdpDatagram) -> io::Result<()> {
+        let Some(id) = crypto::recipient_id(&datagram.payload) else {
+            return Ok(());
+        };
+        let Some(key) = self.keys.get(&id) else {
+            return Ok(());
+        };
+        let Some(plaintext) = crypto::open(&datagram.payload, key) else {
+            return Ok(());
+        };
+        self.inner.handle(&UdpDatagram {
+            source: datagram.source,
+            payload: plaintext,
+        })
+    }
+
+    fn flush(&mut self) {
+        self.inner.flush();
+    }
 }
 
 /// Selectable output format, chosen on the command line.

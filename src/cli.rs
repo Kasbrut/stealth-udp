@@ -7,6 +7,8 @@ use clap::parser::ValueSource;
 use clap::{Arg, ArgMatches, Command};
 
 use crate::config::{self, FileConfig};
+use crate::crypto::KEY_LEN;
+use crate::keyring;
 use crate::sink::OutputFormat;
 
 /// The default UDP port to listen on when nothing else is provided.
@@ -14,6 +16,14 @@ pub const DEFAULT_PORT: u16 = 12345;
 
 /// The default number of seconds between periodic flushes.
 pub const DEFAULT_FLUSH_SECS: u64 = 5;
+
+/// What the user asked the program to do.
+pub enum Invocation {
+    /// Run the sniffer.
+    Run(Args),
+    /// Generate a new client key pair and append its private key to a keyring.
+    GenClient { name: String, keyring_path: String },
+}
 
 /// Command-line arguments resolved at startup.
 pub struct Args {
@@ -25,23 +35,44 @@ pub struct Args {
     pub format: OutputFormat,
     /// How often buffered data is flushed to disk.
     pub flush_interval: Duration,
+    /// Server private keys enabling decryption; empty means "no decryption".
+    pub keyring: Vec<[u8; KEY_LEN]>,
 }
 
-/// Parses the process arguments (merged with the config file) into [`Args`].
-pub fn parse() -> Result<Args, String> {
+/// Parses the process arguments (merged with the config file) into an
+/// [`Invocation`].
+pub fn parse() -> Result<Invocation, String> {
     let matches = command().get_matches();
+
+    // Key-generation mode short-circuits normal running.
+    if let Some(name) = matches.get_one::<String>("gen-client") {
+        let keyring_path = matches
+            .get_one::<String>("keyring")
+            .ok_or("--gen-client requires --keyring <FILE>")?
+            .clone();
+        return Ok(Invocation::GenClient {
+            name: name.clone(),
+            keyring_path,
+        });
+    }
 
     let file_cfg = match matches.get_one::<String>("config") {
         Some(path) => config::load(path)?,
         None => FileConfig::default(),
     };
 
-    Ok(Args {
+    let keyring = match matches.get_one::<String>("keyring") {
+        Some(path) => keyring::load(path)?,
+        None => Vec::new(),
+    };
+
+    Ok(Invocation::Run(Args {
         interface: resolve_interface(&matches, &file_cfg),
         port: resolve_port(&matches, &file_cfg),
         format: resolve_format(&matches, &file_cfg)?,
         flush_interval: Duration::from_secs(resolve_flush_secs(&matches, &file_cfg)),
-    })
+        keyring,
+    }))
 }
 
 fn command() -> Command {
@@ -85,6 +116,18 @@ fn command() -> Command {
                 .long("config")
                 .value_name("FILE")
                 .help("Path to a JSON config file (CLI flags override its values)"),
+        )
+        .arg(
+            Arg::new("keyring")
+                .long("keyring")
+                .value_name("FILE")
+                .help("Server private-key file enabling decryption (also the target of --gen-client)"),
+        )
+        .arg(
+            Arg::new("gen-client")
+                .long("gen-client")
+                .value_name("NAME")
+                .help("Generate a client key pair, append its private key to --keyring, and print its public key"),
         )
 }
 
