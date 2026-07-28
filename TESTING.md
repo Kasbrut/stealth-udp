@@ -172,7 +172,13 @@ Expect: identical file received; the client prints `fec-xor/8` or `fec-rs 10:3`.
 `... send_file -- host:1 /tmp/in.bin --fec 4 --fec-rs 10:3`
 Expect: `error: use either --fec or --fec-rs, not both`, exit 1. Also try
 `--fec-rs 10` (missing `:M`) and `--fec-rs 200:100` (`K+M` too large) → clear
-errors.
+errors. `--interleave` without a FEC flag → `error: --interleave requires
+--fec or --fec-rs`.
+
+- [ ] **D3c. Interleaving**
+CLIENT: `... send_file -- <SRV_IP>:12345 /tmp/in.bin --fec-rs 10:3 --interleave`
+Expect: identical file received; the client prints `interleaved`. On a bursty
+link (D6) it completes where the non-interleaved run of the same FEC would not.
 
 - [ ] **D4. Passes and repeat**
 CLIENT: `... send_file -- <SRV_IP>:12345 /tmp/in.bin --passes 3 --repeat 3`

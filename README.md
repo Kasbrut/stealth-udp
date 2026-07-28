@@ -133,11 +133,18 @@ knobs to survive loss and verify the result:
 | `--delay MICROS`   | Pause after each send (pacing) to avoid overrunning buffers            |
 | `--fec N`          | XOR FEC: one parity per N chunks; rebuilds a single lost chunk per group |
 | `--fec-rs K:M`     | Reed-Solomon FEC: M parity per K chunks; rebuilds up to M losses per block (stronger, tunable) |
+| `--interleave`     | Spread FEC blocks across the transmission for burst-loss resilience (needs `--fec`/`--fec-rs`) |
 | `--compress`       | DEFLATE-compress the file before sending (fewer packets on the wire)   |
 
 `--fec` and `--fec-rs` are mutually exclusive. XOR is cheapest and handles
 isolated losses; Reed-Solomon (`K:M`, with `K+M ≤ 256`) survives up to M losses
 per block and is the better choice on bursty links.
+
+Add `--interleave` (requires a FEC scheme) to spread FEC blocks across the
+transmission, so a burst of consecutive losses is distributed as at most one
+loss per block instead of wiping out a single block — the combination that
+actually survives bursty links. It changes send order only; the server is
+unaffected.
 
 Every transfer also carries a SHA-256 of the original file; the server verifies
 it on completion and, on mismatch, keeps the `.part` instead of writing the
