@@ -17,7 +17,8 @@ use stealth_udp::embed::{self, SLOT_LEN};
 use stealth_udp::protocol::Fec;
 
 const USAGE: &str = "usage: client <HOST:PORT> <FILE> [--chunk-size N] [--repeat N] \
-[--passes N] [--delay MICROS] [--compress] [--fec N | --fec-rs K:M]  |  client --show-key";
+[--passes N] [--delay MICROS] [--compress] [--fec N | --fec-rs K:M] [--interleave]  |  \
+client --show-key";
 
 /// The key slot. Non-zero marker keeps it in the file image; the server patches
 /// the placeholder that follows the marker.
@@ -65,6 +66,7 @@ fn run() -> Result<(), String> {
             "--passes" => opts.passes = parse_num(args.next(), "--passes")?,
             "--delay" => opts.delay = Duration::from_micros(parse_num(args.next(), "--delay")?),
             "--compress" => opts.compress = true,
+            "--interleave" => opts.interleave = true,
             "--fec" => {
                 set_fec(&mut opts, &mut fec_set, parse_fec_xor(args.next())?)?;
             }
@@ -73,6 +75,10 @@ fn run() -> Result<(), String> {
             }
             other => return Err(format!("unexpected argument: {}", other)),
         }
+    }
+
+    if opts.interleave && opts.fec == Fec::None {
+        return Err("--interleave requires --fec or --fec-rs".to_string());
     }
 
     let embedded =

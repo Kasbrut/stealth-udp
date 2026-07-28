@@ -16,7 +16,8 @@ use stealth_udp::crypto::{self, KEY_LEN};
 use stealth_udp::protocol::Fec;
 
 const USAGE: &str = "usage: send_file <HOST:PORT> <FILE> [--chunk-size N] [--repeat N] \
-[--passes N] [--delay MICROS] [--compress] [--fec N | --fec-rs K:M] [--server-key <HEX|FILE>]";
+[--passes N] [--delay MICROS] [--compress] [--fec N | --fec-rs K:M] [--interleave] \
+[--server-key <HEX|FILE>]";
 
 fn main() {
     if let Err(e) = run() {
@@ -38,6 +39,7 @@ fn run() -> Result<(), String> {
             "--passes" => opts.passes = parse_num(args.next(), "--passes")?,
             "--delay" => opts.delay = Duration::from_micros(parse_num(args.next(), "--delay")?),
             "--compress" => opts.compress = true,
+            "--interleave" => opts.interleave = true,
             "--fec" => set_fec(&mut opts, &mut fec_set, parse_fec_xor(args.next())?)?,
             "--fec-rs" => set_fec(&mut opts, &mut fec_set, parse_fec_rs(args.next())?)?,
             "--server-key" => {
@@ -50,6 +52,9 @@ fn run() -> Result<(), String> {
 
     if positional.len() != 2 {
         return Err(USAGE.to_string());
+    }
+    if opts.interleave && opts.fec == Fec::None {
+        return Err("--interleave requires --fec or --fec-rs".to_string());
     }
     send_file(&positional[0], &positional[1], &opts)
 }

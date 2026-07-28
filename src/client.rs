@@ -1,7 +1,7 @@
 //! The file-transfer client: split a file into numbered chunks and send them
 //! over UDP, with optional compression, integrity hash, forward error
-//! correction (XOR or Reed-Solomon), redundancy (repeat / passes), pacing and
-//! encryption.
+//! correction (XOR or Reed-Solomon), FEC block interleaving, redundancy
+//! (repeat / passes), pacing and encryption.
 //!
 //! Shared by the `send_file` example (key passed as an argument) and the
 //! `client` binary (key embedded by the server).
@@ -20,17 +20,17 @@ use crate::protocol::{encode_data, encode_meta, encode_parity, Fec, MetaPacket, 
 /// fragmentation.
 pub const DEFAULT_CHUNK_SIZE: usize = 1400;
 
-/// Default number of times each packet is sent back-to-back. The channel is
-/// one-way (no retransmission), so this cheaply mitigates isolated loss; the
-/// server ignores the duplicates.
+/// Default number of times each packet is sent back-to-back.
 pub const DEFAULT_REPEAT: usize = 2;
 
-/// Resend META every this many data packets so its loss is recoverable on an
-/// unstable link.
+/// Resend META every this many packets so its loss is recoverable.
 const META_RESEND_EVERY: usize = 50;
 
 /// DEFLATE compression level (0-10 in miniz_oxide).
 const COMPRESSION_LEVEL: u8 = 6;
+
+/// Maximum shard count for Reed-Solomon over GF(2^8).
+const RS_MAX_SHARDS: usize = 256;
 
 /// How to send a file. Build with `SendOptions::default()` and override fields.
 pub struct SendOptions {
@@ -38,8 +38,7 @@ pub struct SendOptions {
     pub chunk_size: usize,
     /// Times each packet is sent back-to-back.
     pub repeat: usize,
-    /// Times the whole file is sent (spaced passes resist burst loss better
-    /// than back-to-back repeats).
+    /// Times the whole file is sent.
     pub passes: usize,
     /// Delay after every packet send (pacing); zero disables it.
     pub delay: Duration,
@@ -47,6 +46,8 @@ pub struct SendOptions {
     pub compress: bool,
     /// Forward error correction scheme.
     pub fec: Fec,
+    /// Interleave FEC blocks so a burst spreads across blocks (needs FEC).
+    pub interleave: bool,
     /// Server public key to seal every packet to; `None` sends in the clear.
     pub server_public: Option<[u8; KEY_LEN]>,
 }
@@ -60,15 +61,25 @@ impl Default for SendOptions {
             delay: Duration::ZERO,
             compress: false,
             fec: Fec::None,
+            interleave: false,
             server_public: None,
         }
     }
+}
+
+/// One packet to transmit, in the order the client chose.
+enum Slot {
+    Data(u32),
+    Parity(u32, u16),
 }
 
 /// Sends `path` to `target` according to `opts`.
 pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), String> {
     if opts.chunk_size == 0 {
         return Err("chunk size must be greater than zero".to_string());
+    }
+    if opts.interleave && opts.fec == Fec::None {
+        return Err("--interleave requires --fec or --fec-rs".to_string());
     }
     let repeat = opts.repeat.max(1);
     let passes = opts.passes.max(1);
@@ -126,17 +137,31 @@ pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), Str
     };
 
     let chunks: Vec<&[u8]> = stream.chunks(opts.chunk_size).collect();
+    let parity = compute_parity_blocks(&chunks, opts.fec, opts.chunk_size)?;
+    let order = packet_order(chunks.len() as u32, opts.fec, &parity, opts.interleave);
 
     for _ in 0..passes {
         send(&meta_bytes)?;
-        send_data(&send, &meta_bytes, transfer_id, &chunks)?;
-        send_parity(&send, transfer_id, &chunks, opts.fec, opts.chunk_size)?;
+        for (i, slot) in order.iter().enumerate() {
+            if i > 0 && i.is_multiple_of(META_RESEND_EVERY) {
+                send(&meta_bytes)?;
+            }
+            match slot {
+                Slot::Data(seq) => send(&encode_data(transfer_id, *seq, chunks[*seq as usize]))?,
+                Slot::Parity(block, index) => send(&encode_parity(
+                    transfer_id,
+                    *block,
+                    *index,
+                    &parity[*block as usize][*index as usize],
+                ))?,
+            }
+        }
         // A final META so a late-starting receiver can still complete the file.
         send(&meta_bytes)?;
     }
 
     println!(
-        "Sent '{}' ({} bytes{}) as transfer {}: {} chunk(s), repeat x{}, passes x{}, {}{}.",
+        "Sent '{}' ({} bytes{}) as transfer {}: {} chunk(s), repeat x{}, passes x{}, {}{}{}.",
         meta.filename,
         original_size,
         if opts.compress {
@@ -149,6 +174,7 @@ pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), Str
         repeat,
         passes,
         describe_fec(opts.fec),
+        if opts.interleave { ", interleaved" } else { "" },
         if opts.server_public.is_some() {
             " [encrypted]"
         } else {
@@ -158,99 +184,86 @@ pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), Str
     Ok(())
 }
 
-/// Sends one full pass of the data chunks, resending META periodically.
-fn send_data(
-    send: &impl Fn(&[u8]) -> Result<(), String>,
-    meta_bytes: &[u8],
-    transfer_id: u32,
-    chunks: &[&[u8]],
-) -> Result<(), String> {
-    for (seq, chunk) in chunks.iter().enumerate() {
-        if seq > 0 && seq.is_multiple_of(META_RESEND_EVERY) {
-            send(meta_bytes)?;
-        }
-        send(&encode_data(transfer_id, seq as u32, chunk))?;
-    }
-    Ok(())
-}
-
-/// Sends the parity packets for the chosen FEC scheme.
-fn send_parity(
-    send: &impl Fn(&[u8]) -> Result<(), String>,
-    transfer_id: u32,
+/// Computes the parity shards for every FEC block. `parity[block]` holds one
+/// shard for XOR, or M shards for Reed-Solomon; empty when FEC is off.
+fn compute_parity_blocks(
     chunks: &[&[u8]],
     fec: Fec,
     chunk_size: usize,
-) -> Result<(), String> {
+) -> Result<Vec<Vec<Vec<u8>>>, String> {
     match fec {
-        Fec::None => Ok(()),
-        Fec::Xor { group } => {
-            send_xor_parity(send, transfer_id, chunks, group as usize, chunk_size)
-        }
-        Fec::ReedSolomon { data, parity } => send_rs_parity(
-            send,
-            transfer_id,
-            chunks,
-            data as usize,
-            parity as usize,
-            chunk_size,
-        ),
-    }
-}
-
-fn send_xor_parity(
-    send: &impl Fn(&[u8]) -> Result<(), String>,
-    transfer_id: u32,
-    chunks: &[&[u8]],
-    group: usize,
-    chunk_size: usize,
-) -> Result<(), String> {
-    if group == 0 {
-        return Ok(());
-    }
-    for (block, group_chunks) in chunks.chunks(group).enumerate() {
-        let parity = xor_parity(group_chunks, chunk_size);
-        send(&encode_parity(transfer_id, block as u32, 0, &parity))?;
-    }
-    Ok(())
-}
-
-fn send_rs_parity(
-    send: &impl Fn(&[u8]) -> Result<(), String>,
-    transfer_id: u32,
-    chunks: &[&[u8]],
-    data: usize,
-    parity: usize,
-    chunk_size: usize,
-) -> Result<(), String> {
-    let rs = ReedSolomon::new(data, parity).map_err(|e| format!("invalid Reed-Solomon: {}", e))?;
-
-    for (block, data_chunks) in chunks.chunks(data).enumerate() {
-        // K data shards (padded to chunk_size; short/absent positions are zero)
-        // followed by M zeroed parity shards, then encode.
-        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(data + parity);
-        for i in 0..data {
-            let mut shard = vec![0u8; chunk_size];
-            if let Some(chunk) = data_chunks.get(i) {
-                shard[..chunk.len()].copy_from_slice(chunk);
+        Fec::None => Ok(Vec::new()),
+        Fec::Xor { group } => Ok(chunks
+            .chunks(group as usize)
+            .map(|block| vec![xor_parity(block, chunk_size)])
+            .collect()),
+        Fec::ReedSolomon { data, parity } => {
+            let (k, m) = (data as usize, parity as usize);
+            let rs = ReedSolomon::new(k, m).map_err(|e| format!("invalid Reed-Solomon: {}", e))?;
+            let mut blocks = Vec::new();
+            for block in chunks.chunks(k) {
+                let mut shards: Vec<Vec<u8>> = (0..k)
+                    .map(|i| {
+                        let mut shard = vec![0u8; chunk_size];
+                        if let Some(chunk) = block.get(i) {
+                            shard[..chunk.len()].copy_from_slice(chunk);
+                        }
+                        shard
+                    })
+                    .collect();
+                shards.extend((0..m).map(|_| vec![0u8; chunk_size]));
+                rs.encode(&mut shards)
+                    .map_err(|e| format!("Reed-Solomon encode: {}", e))?;
+                blocks.push(shards.split_off(k));
             }
-            shards.push(shard);
-        }
-        shards.extend((0..parity).map(|_| vec![0u8; chunk_size]));
-
-        rs.encode(&mut shards)
-            .map_err(|e| format!("Reed-Solomon encode: {}", e))?;
-
-        for (index, parity_shard) in shards[data..].iter().enumerate() {
-            send(&encode_parity(
-                transfer_id,
-                block as u32,
-                index as u16,
-                parity_shard,
-            ))?;
+            Ok(blocks)
         }
     }
-    Ok(())
+}
+
+/// The order in which to send DATA and PARITY packets. Without interleaving:
+/// all data, then all parity. With interleaving: column-major across blocks, so
+/// consecutive packets belong to different blocks and a burst spreads out.
+fn packet_order(
+    total_chunks: u32,
+    fec: Fec,
+    parity: &[Vec<Vec<u8>>],
+    interleave: bool,
+) -> Vec<Slot> {
+    let (data_per_block, parity_per_block) = match fec {
+        Fec::None => (total_chunks.max(1) as usize, 0),
+        Fec::Xor { group } => (group as usize, 1),
+        Fec::ReedSolomon { data, parity } => (data as usize, parity as usize),
+    };
+    let num_blocks = parity.len();
+
+    let mut order = Vec::new();
+    if !interleave {
+        for seq in 0..total_chunks {
+            order.push(Slot::Data(seq));
+        }
+        for (block, shards) in parity.iter().enumerate() {
+            for index in 0..shards.len() {
+                order.push(Slot::Parity(block as u32, index as u16));
+            }
+        }
+        return order;
+    }
+
+    for slot in 0..data_per_block + parity_per_block {
+        for block in 0..num_blocks {
+            if slot < data_per_block {
+                let seq = (block * data_per_block + slot) as u32;
+                if seq < total_chunks {
+                    order.push(Slot::Data(seq));
+                }
+            } else {
+                let index = (slot - data_per_block) as u16;
+                order.push(Slot::Parity(block as u32, index));
+            }
+        }
+    }
+    order
 }
 
 /// XOR of the chunks in a group, each treated as padded to `chunk_size`.
@@ -263,9 +276,6 @@ fn xor_parity(group: &[&[u8]], chunk_size: usize) -> Vec<u8> {
     }
     parity
 }
-
-/// Maximum shard count for Reed-Solomon over GF(2^8).
-const RS_MAX_SHARDS: usize = 256;
 
 /// Parses the `--fec N` argument (XOR, group size N).
 pub fn parse_fec_xor(value: Option<String>) -> Result<Fec, String> {
@@ -327,5 +337,67 @@ mod tests {
             }
         }
         assert_eq!(&recovered[..b.len()], &b);
+    }
+
+    fn describe(order: &[Slot]) -> Vec<(char, u32, u16)> {
+        order
+            .iter()
+            .map(|s| match s {
+                Slot::Data(seq) => ('d', *seq, 0),
+                Slot::Parity(b, i) => ('p', *b, *i),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn non_interleaved_order_is_all_data_then_parity() {
+        // 5 chunks, XOR group 2 -> 3 blocks (last block partial), 1 parity each.
+        let parity = vec![vec![vec![0u8]], vec![vec![0u8]], vec![vec![0u8]]];
+        let order = packet_order(5, Fec::Xor { group: 2 }, &parity, false);
+        assert_eq!(
+            describe(&order),
+            vec![
+                ('d', 0, 0),
+                ('d', 1, 0),
+                ('d', 2, 0),
+                ('d', 3, 0),
+                ('d', 4, 0),
+                ('p', 0, 0),
+                ('p', 1, 0),
+                ('p', 2, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn interleaved_order_spreads_blocks() {
+        // Same shape, interleaved: consecutive data come from different blocks.
+        let parity = vec![vec![vec![0u8]], vec![vec![0u8]], vec![vec![0u8]]];
+        let order = packet_order(5, Fec::Xor { group: 2 }, &parity, true);
+        assert_eq!(
+            describe(&order),
+            vec![
+                ('d', 0, 0), // block 0, pos 0
+                ('d', 2, 0), // block 1, pos 0
+                ('d', 4, 0), // block 2, pos 0
+                ('d', 1, 0), // block 0, pos 1
+                ('d', 3, 0), // block 1, pos 1
+                // block 2 has no pos-1 data chunk (partial), skipped
+                ('p', 0, 0),
+                ('p', 1, 0),
+                ('p', 2, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn both_orders_cover_the_same_packets() {
+        let parity = vec![vec![vec![0u8], vec![0u8]], vec![vec![0u8], vec![0u8]]];
+        let fec = Fec::ReedSolomon { data: 3, parity: 2 };
+        let mut a = describe(&packet_order(6, fec, &parity, false));
+        let mut b = describe(&packet_order(6, fec, &parity, true));
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
     }
 }
