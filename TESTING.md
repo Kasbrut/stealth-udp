@@ -104,6 +104,14 @@ Start the server with `sudo` (valid interface), send nothing, press Ctrl-C.
 Expect: within ~200 ms it prints `Received interrupt signal, shutting down...`
 and exits.
 
+- [ ] **B7. Provisioning flag dependencies (no traffic)**
+
+```bash
+./target/release/stealth-udp --gen-client alice          # missing --keyring
+./target/release/stealth-udp --client-template x         # missing --gen-client/-out
+```
+Expect: clap errors listing the required missing arguments, exit 2.
+
 ---
 
 ## Part C — Output formats (live, two hosts)
@@ -154,10 +162,17 @@ CLIENT: `... send_file -- <SRV_IP>:12345 /tmp/in.bin --compress`
 Expect: identical file received (server decompresses). The client prints
 `… , N on the wire` with N ≤ original for compressible input (try a text file).
 
-- [ ] **D3. FEC enabled**
-CLIENT: `... send_file -- <SRV_IP>:12345 /tmp/in.bin --fec 8`
-Expect: identical file received; the client prints `fec/8`. (Recovery of an
-actually-lost chunk is verified in A2; to force real loss see D6.)
+- [ ] **D3. FEC enabled (XOR and Reed-Solomon)**
+CLIENT (XOR): `... send_file -- <SRV_IP>:12345 /tmp/in.bin --fec 8`
+CLIENT (RS):  `... send_file -- <SRV_IP>:12345 /tmp/in.bin --fec-rs 10:3`
+Expect: identical file received; the client prints `fec-xor/8` or `fec-rs 10:3`.
+(Recovery of actually-lost chunks is verified in A2; to force real loss see D6.)
+
+- [ ] **D3b. FEC flags are mutually exclusive (no traffic)**
+`... send_file -- host:1 /tmp/in.bin --fec 4 --fec-rs 10:3`
+Expect: `error: use either --fec or --fec-rs, not both`, exit 1. Also try
+`--fec-rs 10` (missing `:M`) and `--fec-rs 200:100` (`K+M` too large) → clear
+errors.
 
 - [ ] **D4. Passes and repeat**
 CLIENT: `... send_file -- <SRV_IP>:12345 /tmp/in.bin --passes 3 --repeat 3`
@@ -176,6 +191,8 @@ sudo tc qdisc del dev <IFACE> root netem
 ```
 Expect: with enough FEC the file completes; otherwise the server logs
 `Incomplete transfer … missing [...]` on Ctrl-C and keeps a `.part` file.
+Reed-Solomon `--fec-rs K:M` tolerates up to M losses per K-chunk block, so it
+survives heavier/burstier loss than XOR (one per group) at the same overhead.
 
 - [ ] **D7. Integrity check**
 The hash is always sent and verified. A successful transfer implies a matching

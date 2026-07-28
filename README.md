@@ -131,8 +131,13 @@ knobs to survive loss and verify the result:
 | `--repeat N`       | Send each packet N times back-to-back (default 2)                      |
 | `--passes N`       | Send the whole file N times; spaced passes resist *burst* loss better  |
 | `--delay MICROS`   | Pause after each send (pacing) to avoid overrunning buffers            |
-| `--fec N`          | Emit one XOR parity packet per N chunks; the server rebuilds a single lost chunk per group |
+| `--fec N`          | XOR FEC: one parity per N chunks; rebuilds a single lost chunk per group |
+| `--fec-rs K:M`     | Reed-Solomon FEC: M parity per K chunks; rebuilds up to M losses per block (stronger, tunable) |
 | `--compress`       | DEFLATE-compress the file before sending (fewer packets on the wire)   |
+
+`--fec` and `--fec-rs` are mutually exclusive. XOR is cheapest and handles
+isolated losses; Reed-Solomon (`K:M`, with `K+M ≤ 256`) survives up to M losses
+per block and is the better choice on bursty links.
 
 Every transfer also carries a SHA-256 of the original file; the server verifies
 it on completion and, on mismatch, keeps the `.part` instead of writing the
