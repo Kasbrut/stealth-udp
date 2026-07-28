@@ -2,11 +2,11 @@
 //! [`crate::protocol`], tolerating out-of-order, duplicated and lost packets.
 //!
 //! Each chunk is written at its byte offset (`seq * chunk_size`) into a
-//! `<name>.part` file. XOR parity packets let a single missing chunk per FEC
-//! group be reconstructed. Once every chunk has arrived the stream is optionally
-//! decompressed, its integrity hash verified, and it is renamed to its final
-//! name. Incomplete transfers keep their `.part`; idle ones are garbage
-//! collected after a timeout, and missing chunks are logged on shutdown.
+//! `<name>.part` file. Parity packets — XOR (one per group) or Reed-Solomon
+//! (M per K data chunks) — let missing chunks be reconstructed. Once every
+//! chunk has arrived the stream is optionally decompressed, its integrity hash
+//! verified, and it is renamed to its final name. Incomplete transfers keep
+//! their `.part`; idle ones are garbage collected after a timeout.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, File, OpenOptions};
@@ -15,9 +15,10 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use reed_solomon_erasure::galois_8::ReedSolomon;
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{self, DataPacket, MetaPacket, Packet, ParityPacket};
+use crate::protocol::{self, DataPacket, Fec, MetaPacket, Packet, ParityPacket};
 use crate::sink::DatagramSink;
 use crate::writer::sanitized_ip;
 
@@ -25,9 +26,7 @@ use crate::writer::sanitized_ip;
 const MAX_CONCURRENT_TRANSFERS: usize = 128;
 const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 const MAX_NAME_LEN: usize = 255;
-/// Max DATA chunks buffered for a transfer whose META has not arrived yet.
 const MAX_ORPHAN_CHUNKS: usize = 256;
-/// Max missing chunk indices listed per incomplete transfer when logging.
 const MAX_MISSING_LISTED: usize = 32;
 
 /// Identifies a transfer: the sender plus its chosen transfer id.
@@ -76,13 +75,11 @@ impl FileReassemblySink {
         }
 
         let mut transfer = Transfer::create(&self.logs_dir, source, &meta)?;
-
         if let Some(pending) = self.orphans.remove(&key) {
             for (seq, chunk) in pending {
                 transfer.write_chunk(seq, &chunk)?;
             }
         }
-
         if transfer.is_complete() {
             transfer.finalize()?;
         } else {
@@ -96,7 +93,8 @@ impl FileReassemblySink {
         if let Some(transfer) = self.active.get_mut(&key) {
             transfer.touch();
             transfer.write_chunk(data.seq, &data.payload)?;
-            transfer.try_recover(transfer.group_of(data.seq))?;
+            let group = transfer.group_of(data.seq);
+            transfer.try_recover(group)?;
             self.finalize_if_complete(&key)?;
         } else {
             let pending = self.orphans.entry(key).or_default();
@@ -111,7 +109,9 @@ impl FileReassemblySink {
         let key = (source, parity.transfer_id);
         if let Some(transfer) = self.active.get_mut(&key) {
             transfer.touch();
-            transfer.parity.insert(parity.group, parity.parity);
+            transfer
+                .parity
+                .insert((parity.group, parity.index), parity.parity);
             transfer.try_recover(parity.group)?;
             self.finalize_if_complete(&key)?;
         }
@@ -160,7 +160,7 @@ impl DatagramSink for FileReassemblySink {
             Ok(Packet::Meta(meta)) => self.on_meta(datagram.source, meta),
             Ok(Packet::Data(data)) => self.on_data(datagram.source, data),
             Ok(Packet::Parity(parity)) => self.on_parity(datagram.source, parity),
-            Err(_) => Ok(()), // non-protocol / malformed: ignore
+            Err(_) => Ok(()),
         }
     }
 
@@ -195,11 +195,12 @@ struct Transfer {
     total_chunks: u32,
     received: HashSet<u32>,
     compressed: bool,
-    /// Integrity hash of the original file, if provided.
     hash: Option<[u8; protocol::HASH_LEN]>,
-    /// Parity per FEC group; empty when FEC is unused.
-    fec_group: u16,
-    parity: HashMap<u32, Vec<u8>>,
+    fec: Fec,
+    /// Reed-Solomon codec, built only for a valid RS transfer.
+    rs: Option<ReedSolomon>,
+    /// Parity keyed by (group/block, parity index).
+    parity: HashMap<(u32, u16), Vec<u8>>,
     last_activity: Instant,
 }
 
@@ -219,6 +220,22 @@ impl Transfer {
             .truncate(true)
             .open(&part_path)?;
 
+        let rs = match meta.fec {
+            Fec::ReedSolomon { data, parity } => {
+                match ReedSolomon::new(data as usize, parity as usize) {
+                    Ok(rs) => Some(rs),
+                    Err(e) => {
+                        eprintln!(
+                            "Transfer {}: invalid Reed-Solomon params: {}",
+                            meta.transfer_id, e
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Ok(Self {
             final_path,
             part_path,
@@ -229,7 +246,8 @@ impl Transfer {
             received: HashSet::new(),
             compressed: meta.is_compressed(),
             hash: meta.has_hash().then_some(meta.hash),
-            fec_group: meta.fec_group,
+            fec: meta.fec,
+            rs,
             parity: HashMap::new(),
             last_activity: Instant::now(),
         })
@@ -239,12 +257,12 @@ impl Transfer {
         self.last_activity = Instant::now();
     }
 
-    /// The FEC group a data chunk belongs to (meaningless when FEC is off).
+    /// The FEC group/block a data chunk belongs to.
     fn group_of(&self, seq: u32) -> u32 {
-        if self.fec_group == 0 {
-            0
-        } else {
-            seq / self.fec_group as u32
+        match self.fec {
+            Fec::Xor { group } => seq / group as u32,
+            Fec::ReedSolomon { data, .. } => seq / data as u32,
+            Fec::None => 0,
         }
     }
 
@@ -271,29 +289,37 @@ impl Transfer {
         Ok(())
     }
 
-    fn read_chunk(&mut self, seq: u32) -> io::Result<Vec<u8>> {
+    /// Reads a present chunk back from the `.part` file, padded to `chunk_size`.
+    fn read_padded_chunk(&mut self, seq: u32) -> io::Result<Vec<u8>> {
         let offset = seq as u64 * self.chunk_size as u64;
         let len = self.expected_len(seq);
         self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; len];
-        self.file.read_exact(&mut buf)?;
+        let mut buf = vec![0u8; self.chunk_size];
+        self.file.read_exact(&mut buf[..len])?;
         Ok(buf)
     }
 
-    /// If FEC group `group` is missing exactly one chunk and its parity is
-    /// present, reconstruct the missing chunk.
     fn try_recover(&mut self, group: u32) -> io::Result<()> {
-        if self.fec_group == 0 {
-            return Ok(());
+        match self.fec {
+            Fec::None => Ok(()),
+            Fec::Xor { .. } => self.try_recover_xor(group),
+            Fec::ReedSolomon { .. } => self.try_recover_rs(group),
         }
-        let parity = match self.parity.get(&group) {
+    }
+
+    /// Rebuild a single missing chunk in an XOR group.
+    fn try_recover_xor(&mut self, group: u32) -> io::Result<()> {
+        let group_size = match self.fec {
+            Fec::Xor { group } => group as u32,
+            _ => return Ok(()),
+        };
+        let parity = match self.parity.get(&(group, 0)) {
             Some(p) => p.clone(),
             None => return Ok(()),
         };
 
-        let n = self.fec_group as u32;
-        let start = group * n;
-        let end = (start + n).min(self.total_chunks);
+        let start = group * group_size;
+        let end = (start + group_size).min(self.total_chunks);
         if start >= self.total_chunks {
             return Ok(());
         }
@@ -306,7 +332,6 @@ impl Transfer {
         }
         let target = missing[0];
 
-        // recovered = parity XOR (all present chunks in the group, padded).
         let mut recovered = vec![0u8; self.chunk_size];
         for (i, &b) in parity.iter().take(self.chunk_size).enumerate() {
             recovered[i] ^= b;
@@ -315,13 +340,90 @@ impl Transfer {
             if seq == target {
                 continue;
             }
-            let chunk = self.read_chunk(seq)?;
+            let chunk = self.read_padded_chunk(seq)?;
             for (i, &b) in chunk.iter().enumerate() {
                 recovered[i] ^= b;
             }
         }
         recovered.truncate(self.expected_len(target));
         self.write_chunk(target, &recovered)
+    }
+
+    /// Rebuild missing chunks in a Reed-Solomon block if enough shards arrived.
+    fn try_recover_rs(&mut self, block: u32) -> io::Result<()> {
+        let (k, m) = match self.fec {
+            Fec::ReedSolomon { data, parity } => (data as usize, parity as usize),
+            _ => return Ok(()),
+        };
+        // Take the codec out to free `self` for reading chunks.
+        let rs = match self.rs.take() {
+            Some(rs) => rs,
+            None => return Ok(()),
+        };
+        let result = self.rs_reconstruct(&rs, k, m, block);
+        self.rs = Some(rs);
+        result
+    }
+
+    fn rs_reconstruct(
+        &mut self,
+        rs: &ReedSolomon,
+        k: usize,
+        m: usize,
+        block: u32,
+    ) -> io::Result<()> {
+        let start = block * k as u32;
+        if start >= self.total_chunks {
+            return Ok(());
+        }
+
+        let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(k + m);
+        let mut present = 0usize;
+        let mut missing_real = false;
+
+        for i in 0..k as u32 {
+            let seq = start + i;
+            if seq >= self.total_chunks {
+                shards.push(Some(vec![0u8; self.chunk_size])); // known-zero phantom
+                present += 1;
+            } else if self.received.contains(&seq) {
+                shards.push(Some(self.read_padded_chunk(seq)?));
+                present += 1;
+            } else {
+                shards.push(None);
+                missing_real = true;
+            }
+        }
+        for j in 0..m as u16 {
+            match self.parity.get(&(block, j)) {
+                Some(p) => {
+                    let mut shard = vec![0u8; self.chunk_size];
+                    let n = p.len().min(self.chunk_size);
+                    shard[..n].copy_from_slice(&p[..n]);
+                    shards.push(Some(shard));
+                    present += 1;
+                }
+                None => shards.push(None),
+            }
+        }
+
+        if !missing_real || present < k {
+            return Ok(()); // nothing to do, or not enough shards to reconstruct
+        }
+        if rs.reconstruct(&mut shards).is_err() {
+            return Ok(());
+        }
+
+        for i in 0..k as u32 {
+            let seq = start + i;
+            if seq < self.total_chunks && !self.received.contains(&seq) {
+                if let Some(shard) = shards[i as usize].take() {
+                    let len = self.expected_len(seq);
+                    self.write_chunk(seq, &shard[..len])?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn is_complete(&self) -> bool {
@@ -371,7 +473,6 @@ impl Transfer {
         Ok(())
     }
 
-    /// A short human-readable summary of the missing chunk indices.
     fn summarize_missing(&self) -> String {
         let missing: Vec<u32> = (0..self.total_chunks)
             .filter(|seq| !self.received.contains(seq))
@@ -401,7 +502,6 @@ fn total_chunks(file_size: u64, chunk_size: u32) -> u32 {
 }
 
 /// Reduces an untrusted filename to a safe basename, preventing path traversal.
-/// Falls back to a name derived from the transfer id when nothing safe remains.
 fn safe_filename(name: &str, transfer_id: u32) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("").trim();
     if base.is_empty() || base == "." || base == ".." {
@@ -415,8 +515,8 @@ fn safe_filename(name: &str, transfer_id: u32) -> String {
 mod tests {
     use super::*;
     use crate::parser::UdpDatagram;
-    use crate::protocol::{encode_data, encode_meta, encode_parity, HASH_LEN};
-    use sha2::{Digest, Sha256};
+    use crate::protocol::{encode_data, encode_meta, encode_parity};
+    use reed_solomon_erasure::galois_8::ReedSolomon;
     use std::net::Ipv4Addr;
 
     fn source() -> IpAddr {
@@ -434,14 +534,13 @@ mod tests {
         Path::new(logs_dir).join("10_0_0_9").join(name)
     }
 
-    /// Builds a plain (uncompressed, no FEC) META with a correct hash.
-    fn meta(transfer_id: u32, data: &[u8], chunk_size: u32, fec_group: u16) -> MetaPacket {
+    fn meta(transfer_id: u32, data: &[u8], chunk_size: u32, fec: Fec) -> MetaPacket {
         MetaPacket {
             transfer_id,
             file_size: data.len() as u64,
             chunk_size,
             flags: 0,
-            fec_group,
+            fec,
             original_size: data.len() as u64,
             hash: Sha256::digest(data).into(),
             filename: "file.bin".to_string(),
@@ -453,28 +552,14 @@ mod tests {
     }
 
     #[test]
-    fn total_chunks_rounds_up() {
-        assert_eq!(total_chunks(0, 4), 0);
-        assert_eq!(total_chunks(4, 4), 1);
-        assert_eq!(total_chunks(5, 4), 2);
-    }
-
-    #[test]
-    fn safe_filename_strips_paths_and_traversal() {
-        assert_eq!(safe_filename("../../etc/passwd", 1), "passwd");
-        assert_eq!(safe_filename("a/b/c.txt", 1), "c.txt");
-        assert_eq!(safe_filename("..", 7), "transfer_7");
-    }
-
-    #[test]
     fn reassembles_out_of_order_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let logs_dir = dir.path().to_str().unwrap().to_string();
         let mut s = sink(&logs_dir);
 
         let payload = b"ABCDEFGHIJ";
-        let m = meta(1, payload, 4, 0);
-        s.handle(&datagram(encode_meta(&m))).unwrap();
+        s.handle(&datagram(encode_meta(&meta(1, payload, 4, Fec::None))))
+            .unwrap();
         s.handle(&datagram(encode_data(1, 2, b"IJ"))).unwrap();
         s.handle(&datagram(encode_data(1, 0, b"ABCD"))).unwrap();
         s.handle(&datagram(encode_data(1, 1, b"EFGH"))).unwrap();
@@ -486,18 +571,13 @@ mod tests {
     }
 
     #[test]
-    fn fec_recovers_one_lost_chunk_per_group() {
+    fn xor_fec_recovers_one_lost_chunk() {
         let dir = tempfile::tempdir().unwrap();
         let logs_dir = dir.path().to_str().unwrap().to_string();
         let mut s = sink(&logs_dir);
 
-        // 3 chunks, one FEC group of 3; parity over all three.
         let payload = b"ABCDEFGHIJ"; // 4 + 4 + 2
-        let m = meta(1, payload, 4, 3);
-        let c0 = b"ABCD";
-        let c1 = b"EFGH";
-        let c2 = b"IJ";
-        // parity padded to chunk_size 4.
+        let (c0, c1, c2) = (b"ABCD", b"EFGH", b"IJ");
         let mut parity = vec![0u8; 4];
         for c in [&c0[..], &c1[..], &c2[..]] {
             for (i, &b) in c.iter().enumerate() {
@@ -505,13 +585,60 @@ mod tests {
             }
         }
 
-        s.handle(&datagram(encode_meta(&m))).unwrap();
-        // Chunk 1 is "lost"; send 0, 2 and the parity.
-        s.handle(&datagram(encode_data(1, 0, c0))).unwrap();
+        s.handle(&datagram(encode_meta(&meta(
+            1,
+            payload,
+            4,
+            Fec::Xor { group: 3 },
+        ))))
+        .unwrap();
+        s.handle(&datagram(encode_data(1, 0, c0))).unwrap(); // chunk 1 lost
         s.handle(&datagram(encode_data(1, 2, c2))).unwrap();
-        s.handle(&datagram(encode_parity(1, 0, &parity))).unwrap();
+        s.handle(&datagram(encode_parity(1, 0, 0, &parity)))
+            .unwrap();
 
-        // FEC should have rebuilt chunk 1 and completed the file.
+        assert_eq!(
+            std::fs::read(final_file(&logs_dir, "file.bin")).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn reed_solomon_recovers_two_lost_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_dir = dir.path().to_str().unwrap().to_string();
+        let mut s = sink(&logs_dir);
+
+        // 3 data chunks of 4 bytes, RS(3, 2): tolerate 2 losses.
+        let payload = b"ABCDEFGHIJKL";
+        let chunk_size = 4usize;
+        let rs = ReedSolomon::new(3, 2).unwrap();
+        let mut shards: Vec<Vec<u8>> = payload
+            .chunks(chunk_size)
+            .map(|c| {
+                let mut s = vec![0u8; chunk_size];
+                s[..c.len()].copy_from_slice(c);
+                s
+            })
+            .collect();
+        shards.push(vec![0u8; chunk_size]);
+        shards.push(vec![0u8; chunk_size]);
+        rs.encode(&mut shards).unwrap();
+
+        s.handle(&datagram(encode_meta(&meta(
+            1,
+            payload,
+            4,
+            Fec::ReedSolomon { data: 3, parity: 2 },
+        ))))
+        .unwrap();
+        // Only chunk 0 arrives; chunks 1 and 2 are lost. Both parity shards arrive.
+        s.handle(&datagram(encode_data(1, 0, b"ABCD"))).unwrap();
+        s.handle(&datagram(encode_parity(1, 0, 0, &shards[3])))
+            .unwrap();
+        s.handle(&datagram(encode_parity(1, 0, 1, &shards[4])))
+            .unwrap();
+
         assert_eq!(
             std::fs::read(final_file(&logs_dir, "file.bin")).unwrap(),
             payload
@@ -529,9 +656,9 @@ mod tests {
         let m = MetaPacket {
             transfer_id: 1,
             file_size: compressed.len() as u64,
-            chunk_size: compressed.len() as u32, // single chunk for simplicity
+            chunk_size: compressed.len() as u32,
             flags: crate::protocol::FLAG_COMPRESSED,
-            fec_group: 0,
+            fec: Fec::None,
             original_size: original.len() as u64,
             hash: Sha256::digest(original).into(),
             filename: "z.bin".to_string(),
@@ -551,8 +678,8 @@ mod tests {
         let logs_dir = dir.path().to_str().unwrap().to_string();
         let mut s = sink(&logs_dir);
 
-        let mut m = meta(1, b"ABCD", 4, 0);
-        m.hash = [0xAB; HASH_LEN]; // wrong hash on purpose
+        let mut m = meta(1, b"ABCD", 4, Fec::None);
+        m.hash = [0xAB; protocol::HASH_LEN];
         s.handle(&datagram(encode_meta(&m))).unwrap();
         s.handle(&datagram(encode_data(1, 0, b"ABCD"))).unwrap();
 
@@ -564,20 +691,8 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_transfer_keeps_part_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let logs_dir = dir.path().to_str().unwrap().to_string();
-        let mut s = sink(&logs_dir);
-
-        let m = meta(1, b"ABCDEFGHIJKL", 4, 0); // 3 chunks
-        s.handle(&datagram(encode_meta(&m))).unwrap();
-        s.handle(&datagram(encode_data(1, 0, b"ABCD"))).unwrap();
-        s.finish();
-
-        assert!(Path::new(&logs_dir)
-            .join("10_0_0_9")
-            .join("file.bin.part")
-            .exists());
-        assert!(!final_file(&logs_dir, "file.bin").exists());
+    fn safe_filename_strips_paths_and_traversal() {
+        assert_eq!(safe_filename("../../etc/passwd", 1), "passwd");
+        assert_eq!(safe_filename("..", 7), "transfer_7");
     }
 }

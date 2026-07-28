@@ -11,11 +11,12 @@ use std::path::Path;
 use std::process;
 use std::time::Duration;
 
-use stealth_udp::client::{send_file, SendOptions};
+use stealth_udp::client::{parse_fec_rs, parse_fec_xor, send_file, SendOptions};
 use stealth_udp::crypto::{self, KEY_LEN};
+use stealth_udp::protocol::Fec;
 
 const USAGE: &str = "usage: send_file <HOST:PORT> <FILE> [--chunk-size N] [--repeat N] \
-[--passes N] [--delay MICROS] [--compress] [--fec N] [--server-key <HEX|FILE>]";
+[--passes N] [--delay MICROS] [--compress] [--fec N | --fec-rs K:M] [--server-key <HEX|FILE>]";
 
 fn main() {
     if let Err(e) = run() {
@@ -27,6 +28,7 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut positional = Vec::new();
     let mut opts = SendOptions::default();
+    let mut fec_set = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -35,8 +37,9 @@ fn run() -> Result<(), String> {
             "--repeat" => opts.repeat = parse_num(args.next(), "--repeat")?,
             "--passes" => opts.passes = parse_num(args.next(), "--passes")?,
             "--delay" => opts.delay = Duration::from_micros(parse_num(args.next(), "--delay")?),
-            "--fec" => opts.fec_group = parse_num(args.next(), "--fec")?,
             "--compress" => opts.compress = true,
+            "--fec" => set_fec(&mut opts, &mut fec_set, parse_fec_xor(args.next())?)?,
+            "--fec-rs" => set_fec(&mut opts, &mut fec_set, parse_fec_rs(args.next())?)?,
             "--server-key" => {
                 let value = args.next().ok_or("--server-key needs a value")?;
                 opts.server_public = Some(load_server_key(&value)?);
@@ -49,6 +52,16 @@ fn run() -> Result<(), String> {
         return Err(USAGE.to_string());
     }
     send_file(&positional[0], &positional[1], &opts)
+}
+
+/// Sets the FEC scheme, rejecting a second, conflicting FEC flag.
+fn set_fec(opts: &mut SendOptions, already_set: &mut bool, fec: Fec) -> Result<(), String> {
+    if *already_set {
+        return Err("use either --fec or --fec-rs, not both".to_string());
+    }
+    *already_set = true;
+    opts.fec = fec;
+    Ok(())
 }
 
 fn parse_num<T: std::str::FromStr>(value: Option<String>, flag: &str) -> Result<T, String> {

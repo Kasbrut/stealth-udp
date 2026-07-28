@@ -18,6 +18,7 @@ chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 miniz_oxide = "0.8"
+reed-solomon-erasure = "6"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]

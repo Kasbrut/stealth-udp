@@ -1,6 +1,7 @@
 //! The file-transfer client: split a file into numbered chunks and send them
-//! over UDP, with optional compression, integrity hash, XOR forward error
-//! correction, redundancy (repeat / passes), pacing and encryption.
+//! over UDP, with optional compression, integrity hash, forward error
+//! correction (XOR or Reed-Solomon), redundancy (repeat / passes), pacing and
+//! encryption.
 //!
 //! Shared by the `send_file` example (key passed as an argument) and the
 //! `client` binary (key embedded by the server).
@@ -9,10 +10,11 @@ use std::net::UdpSocket;
 use std::path::Path;
 use std::time::Duration;
 
+use reed_solomon_erasure::galois_8::ReedSolomon;
 use sha2::{Digest, Sha256};
 
 use crate::crypto::{self, KEY_LEN};
-use crate::protocol::{encode_data, encode_meta, encode_parity, MetaPacket, FLAG_COMPRESSED};
+use crate::protocol::{encode_data, encode_meta, encode_parity, Fec, MetaPacket, FLAG_COMPRESSED};
 
 /// Default UDP payload chunk size, kept below a typical MTU to avoid IP
 /// fragmentation.
@@ -43,8 +45,8 @@ pub struct SendOptions {
     pub delay: Duration,
     /// Compress the file before sending.
     pub compress: bool,
-    /// Emit one XOR parity packet per this many data chunks; 0 disables FEC.
-    pub fec_group: u16,
+    /// Forward error correction scheme.
+    pub fec: Fec,
     /// Server public key to seal every packet to; `None` sends in the clear.
     pub server_public: Option<[u8; KEY_LEN]>,
 }
@@ -57,7 +59,7 @@ impl Default for SendOptions {
             passes: 1,
             delay: Duration::ZERO,
             compress: false,
-            fec_group: 0,
+            fec: Fec::None,
             server_public: None,
         }
     }
@@ -76,8 +78,10 @@ pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), Str
     let hash: [u8; 32] = Sha256::digest(&original).into();
 
     let (stream, flags) = if opts.compress {
-        let compressed = miniz_oxide::deflate::compress_to_vec(&original, COMPRESSION_LEVEL);
-        (compressed, FLAG_COMPRESSED)
+        (
+            miniz_oxide::deflate::compress_to_vec(&original, COMPRESSION_LEVEL),
+            FLAG_COMPRESSED,
+        )
     } else {
         (original, 0)
     };
@@ -98,7 +102,7 @@ pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), Str
         file_size: stream.len() as u64,
         chunk_size: opts.chunk_size as u32,
         flags,
-        fec_group: opts.fec_group,
+        fec: opts.fec,
         original_size,
         hash,
         filename,
@@ -125,20 +129,14 @@ pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), Str
 
     for _ in 0..passes {
         send(&meta_bytes)?;
-        send_pass(
-            &send,
-            &meta_bytes,
-            transfer_id,
-            &chunks,
-            opts.fec_group,
-            opts.chunk_size,
-        )?;
+        send_data(&send, &meta_bytes, transfer_id, &chunks)?;
+        send_parity(&send, transfer_id, &chunks, opts.fec, opts.chunk_size)?;
         // A final META so a late-starting receiver can still complete the file.
         send(&meta_bytes)?;
     }
 
     println!(
-        "Sent '{}' ({} bytes{}) as transfer {}: {} chunk(s), repeat x{}, passes x{}{}{}.",
+        "Sent '{}' ({} bytes{}) as transfer {}: {} chunk(s), repeat x{}, passes x{}, {}{}.",
         meta.filename,
         original_size,
         if opts.compress {
@@ -150,11 +148,7 @@ pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), Str
         chunks.len(),
         repeat,
         passes,
-        if opts.fec_group > 0 {
-            format!(", fec/{}", opts.fec_group)
-        } else {
-            String::new()
-        },
+        describe_fec(opts.fec),
         if opts.server_public.is_some() {
             " [encrypted]"
         } else {
@@ -164,39 +158,97 @@ pub fn send_file(target: &str, path: &str, opts: &SendOptions) -> Result<(), Str
     Ok(())
 }
 
-/// Sends one full pass over the data chunks, emitting a parity packet after
-/// each complete FEC group (and a final one for a trailing partial group).
-fn send_pass(
+/// Sends one full pass of the data chunks, resending META periodically.
+fn send_data(
     send: &impl Fn(&[u8]) -> Result<(), String>,
     meta_bytes: &[u8],
     transfer_id: u32,
     chunks: &[&[u8]],
-    fec_group: u16,
-    chunk_size: usize,
 ) -> Result<(), String> {
-    let group = fec_group as usize;
-
     for (seq, chunk) in chunks.iter().enumerate() {
-        // Periodically resend META so a late receiver can still start.
         if seq > 0 && seq.is_multiple_of(META_RESEND_EVERY) {
             send(meta_bytes)?;
         }
         send(&encode_data(transfer_id, seq as u32, chunk))?;
-
-        if group > 0 && (seq + 1) % group == 0 {
-            let g = seq / group;
-            let start = g * group;
-            let parity = xor_parity(&chunks[start..=seq], chunk_size);
-            send(&encode_parity(transfer_id, g as u32, &parity))?;
-        }
     }
+    Ok(())
+}
 
-    // Trailing partial group.
-    if group > 0 && !chunks.is_empty() && !chunks.len().is_multiple_of(group) {
-        let g = chunks.len() / group;
-        let start = g * group;
-        let parity = xor_parity(&chunks[start..], chunk_size);
-        send(&encode_parity(transfer_id, g as u32, &parity))?;
+/// Sends the parity packets for the chosen FEC scheme.
+fn send_parity(
+    send: &impl Fn(&[u8]) -> Result<(), String>,
+    transfer_id: u32,
+    chunks: &[&[u8]],
+    fec: Fec,
+    chunk_size: usize,
+) -> Result<(), String> {
+    match fec {
+        Fec::None => Ok(()),
+        Fec::Xor { group } => {
+            send_xor_parity(send, transfer_id, chunks, group as usize, chunk_size)
+        }
+        Fec::ReedSolomon { data, parity } => send_rs_parity(
+            send,
+            transfer_id,
+            chunks,
+            data as usize,
+            parity as usize,
+            chunk_size,
+        ),
+    }
+}
+
+fn send_xor_parity(
+    send: &impl Fn(&[u8]) -> Result<(), String>,
+    transfer_id: u32,
+    chunks: &[&[u8]],
+    group: usize,
+    chunk_size: usize,
+) -> Result<(), String> {
+    if group == 0 {
+        return Ok(());
+    }
+    for (block, group_chunks) in chunks.chunks(group).enumerate() {
+        let parity = xor_parity(group_chunks, chunk_size);
+        send(&encode_parity(transfer_id, block as u32, 0, &parity))?;
+    }
+    Ok(())
+}
+
+fn send_rs_parity(
+    send: &impl Fn(&[u8]) -> Result<(), String>,
+    transfer_id: u32,
+    chunks: &[&[u8]],
+    data: usize,
+    parity: usize,
+    chunk_size: usize,
+) -> Result<(), String> {
+    let rs = ReedSolomon::new(data, parity).map_err(|e| format!("invalid Reed-Solomon: {}", e))?;
+
+    for (block, data_chunks) in chunks.chunks(data).enumerate() {
+        // K data shards (padded to chunk_size; short/absent positions are zero)
+        // followed by M zeroed parity shards, then encode.
+        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(data + parity);
+        for i in 0..data {
+            let mut shard = vec![0u8; chunk_size];
+            if let Some(chunk) = data_chunks.get(i) {
+                shard[..chunk.len()].copy_from_slice(chunk);
+            }
+            shards.push(shard);
+        }
+        shards.extend((0..parity).map(|_| vec![0u8; chunk_size]));
+
+        rs.encode(&mut shards)
+            .map_err(|e| format!("Reed-Solomon encode: {}", e))?;
+
+        for (index, parity_shard) in shards[data..].iter().enumerate() {
+            send(&encode_parity(
+                transfer_id,
+                block as u32,
+                index as u16,
+                parity_shard,
+            ))?;
+        }
     }
     Ok(())
 }
@@ -212,20 +264,62 @@ fn xor_parity(group: &[&[u8]], chunk_size: usize) -> Vec<u8> {
     parity
 }
 
+/// Maximum shard count for Reed-Solomon over GF(2^8).
+const RS_MAX_SHARDS: usize = 256;
+
+/// Parses the `--fec N` argument (XOR, group size N).
+pub fn parse_fec_xor(value: Option<String>) -> Result<Fec, String> {
+    let group: u16 = value
+        .ok_or("--fec needs a value")?
+        .parse()
+        .map_err(|_| "--fec must be a number".to_string())?;
+    if group == 0 {
+        return Err("--fec must be >= 1".to_string());
+    }
+    Ok(Fec::Xor { group })
+}
+
+/// Parses the `--fec-rs K:M` argument (Reed-Solomon, K data, M parity).
+pub fn parse_fec_rs(value: Option<String>) -> Result<Fec, String> {
+    let spec = value.ok_or("--fec-rs needs K:M (e.g. 10:3)")?;
+    let (k, m) = spec
+        .split_once(':')
+        .ok_or("--fec-rs must be K:M (e.g. 10:3)")?;
+    let data: u16 = k
+        .parse()
+        .map_err(|_| "--fec-rs K must be a number".to_string())?;
+    let parity: u16 = m
+        .parse()
+        .map_err(|_| "--fec-rs M must be a number".to_string())?;
+    if data == 0 || parity == 0 {
+        return Err("--fec-rs K and M must be >= 1".to_string());
+    }
+    if data as usize + parity as usize > RS_MAX_SHARDS {
+        return Err("--fec-rs K+M must be <= 256".to_string());
+    }
+    Ok(Fec::ReedSolomon { data, parity })
+}
+
+fn describe_fec(fec: Fec) -> String {
+    match fec {
+        Fec::None => "no fec".to_string(),
+        Fec::Xor { group } => format!("fec-xor/{}", group),
+        Fec::ReedSolomon { data, parity } => format!("fec-rs {}:{}", data, parity),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn xor_parity_recovers_a_missing_chunk() {
-        // parity ^ (all-but-one present chunks) == the missing chunk.
         let a = [1u8, 2, 3, 4];
         let b = [5u8, 6, 7, 8];
-        let c = [9u8, 10]; // shorter last chunk
+        let c = [9u8, 10];
         let group: Vec<&[u8]> = vec![&a, &b, &c];
         let parity = xor_parity(&group, 4);
 
-        // Reconstruct `b` from parity and the others (padded to chunk_size).
         let mut recovered = parity.clone();
         for chunk in [&a[..], &c[..]] {
             for (i, &byte) in chunk.iter().enumerate() {

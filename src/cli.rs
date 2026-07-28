@@ -155,18 +155,23 @@ fn command() -> Command {
             Arg::new("gen-client")
                 .long("gen-client")
                 .value_name("NAME")
+                .requires("keyring")
                 .help("Generate a client key pair, append its private key to --keyring, and print its public key"),
         )
         .arg(
             Arg::new("client-template")
                 .long("client-template")
                 .value_name("FILE")
+                .requires("gen-client")
+                .requires("client-out")
                 .help("With --gen-client: an unprovisioned client binary to patch with the public key"),
         )
         .arg(
             Arg::new("client-out")
                 .long("client-out")
                 .value_name("FILE")
+                .requires("gen-client")
+                .requires("client-template")
                 .help("With --gen-client and --client-template: where to write the provisioned client binary"),
         )
 }

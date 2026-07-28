@@ -9,7 +9,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use stealth_udp::crypto;
 use stealth_udp::parser::UdpDatagram;
-use stealth_udp::protocol::{encode_data, encode_meta, MetaPacket};
+use stealth_udp::protocol::{encode_data, encode_meta, Fec, MetaPacket};
 use stealth_udp::reassembly::FileReassemblySink;
 use stealth_udp::sink::{DatagramSink, DecryptingSink};
 
@@ -26,7 +26,7 @@ fn meta(transfer_id: u32, data: &[u8], chunk_size: u32, filename: &str) -> MetaP
         file_size: data.len() as u64,
         chunk_size,
         flags: 0,
-        fec_group: 0,
+        fec: Fec::None,
         original_size: data.len() as u64,
         hash: Sha256::digest(data).into(),
         filename: filename.to_string(),

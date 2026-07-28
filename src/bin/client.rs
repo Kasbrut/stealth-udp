@@ -11,12 +11,13 @@
 
 use std::time::Duration;
 
-use stealth_udp::client::{send_file, SendOptions};
+use stealth_udp::client::{parse_fec_rs, parse_fec_xor, send_file, SendOptions};
 use stealth_udp::crypto::to_hex;
 use stealth_udp::embed::{self, SLOT_LEN};
+use stealth_udp::protocol::Fec;
 
 const USAGE: &str = "usage: client <HOST:PORT> <FILE> [--chunk-size N] [--repeat N] \
-[--passes N] [--delay MICROS] [--compress] [--fec N]  |  client --show-key";
+[--passes N] [--delay MICROS] [--compress] [--fec N | --fec-rs K:M]  |  client --show-key";
 
 /// The key slot. Non-zero marker keeps it in the file image; the server patches
 /// the placeholder that follows the marker.
@@ -56,14 +57,20 @@ fn run() -> Result<(), String> {
     let path = args.next().ok_or(USAGE)?;
 
     let mut opts = SendOptions::default();
+    let mut fec_set = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--chunk-size" => opts.chunk_size = parse_num(args.next(), "--chunk-size")?,
             "--repeat" => opts.repeat = parse_num(args.next(), "--repeat")?,
             "--passes" => opts.passes = parse_num(args.next(), "--passes")?,
             "--delay" => opts.delay = Duration::from_micros(parse_num(args.next(), "--delay")?),
-            "--fec" => opts.fec_group = parse_num(args.next(), "--fec")?,
             "--compress" => opts.compress = true,
+            "--fec" => {
+                set_fec(&mut opts, &mut fec_set, parse_fec_xor(args.next())?)?;
+            }
+            "--fec-rs" => {
+                set_fec(&mut opts, &mut fec_set, parse_fec_rs(args.next())?)?;
+            }
             other => return Err(format!("unexpected argument: {}", other)),
         }
     }
@@ -79,4 +86,14 @@ fn parse_num<T: std::str::FromStr>(value: Option<String>, flag: &str) -> Result<
         .ok_or_else(|| format!("{} needs a value", flag))?
         .parse()
         .map_err(|_| format!("{} must be a number", flag))
+}
+
+/// Sets the FEC scheme, rejecting a second, conflicting FEC flag.
+fn set_fec(opts: &mut SendOptions, already_set: &mut bool, fec: Fec) -> Result<(), String> {
+    if *already_set {
+        return Err("use either --fec or --fec-rs, not both".to_string());
+    }
+    *already_set = true;
+    opts.fec = fec;
+    Ok(())
 }
