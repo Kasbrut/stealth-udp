@@ -45,6 +45,12 @@ Capturing needs libpcap at build/runtime:
 - **macOS:** ships with the OS, nothing to install
 - **Windows:** install [Npcap](https://npcap.com/)
 
+**Two hosts on the same L2 network.** Capture happens at the data-link layer,
+so traffic a host sends to *itself* (loopback) never reaches the sniffer — a
+single machine cannot capture its own client. Run the server and the client on
+two different machines (or a VM bridged to the host) on the same local network.
+See [TESTING.md](TESTING.md) for the full topology note.
+
 ## Building
 
 Build the server and the client template in release mode:
@@ -88,6 +94,10 @@ cargo build --release --bin client
 | `--flush-interval <SECS>`  | Seconds between periodic flushes to disk (`0` disables; default `5`)    |
 | `--transfer-timeout <SECS>`| Idle seconds before an incomplete file transfer is dropped (`0` disables; default `300`) |
 | `-c, --config <FILE>`      | JSON config file; CLI flags override its values                        |
+| `--keyring <FILE>`         | Server private-key file enabling decryption; also the target of `--gen-client` (see [Encryption](#encryption-optional)) |
+| `--gen-client <NAME>`      | Generate a client key pair, append its private key to `--keyring`, and print its public key |
+| `--client-template <FILE>` | With `--gen-client`: an unprovisioned client binary to patch with the public key |
+| `--client-out <FILE>`      | With `--gen-client` + `--client-template`: where to write the provisioned client binary |
 
 ### Output formats
 
@@ -100,7 +110,7 @@ cargo build --release --bin client
   (`protocol.rs`). The client announces a file (name, size, chunk size) and
   sends numbered chunks; the server places each chunk at its offset, so it
   tolerates reordering, duplication and loss. Completed files land in
-  `logs/<IP>/<name>`; incomplete ones keep a `.part` file and the missing
+  `<YYYY-MM-DD>-logs/<IP>/<name>`; incomplete ones keep a `.part` file and the missing
   chunks are logged on shutdown. See the `send_file` example for a client.
 
 Both IPv4 and IPv6 sources are supported.
@@ -129,12 +139,13 @@ knobs to survive loss and verify the result:
 |--------------------|------------------------------------------------------------------------|
 | `--chunk-size N`   | Payload bytes per packet (default 1400)                                |
 | `--repeat N`       | Send each packet N times back-to-back (default 2)                      |
-| `--passes N`       | Send the whole file N times; spaced passes resist *burst* loss better  |
-| `--delay MICROS`   | Pause after each send (pacing) to avoid overrunning buffers            |
+| `--passes N`       | Send the whole file N times (default 1); spaced passes resist *burst* loss better |
+| `--delay MICROS`   | Pause after each send in microseconds (default 0, off) to avoid overrunning buffers |
 | `--fec N`          | XOR FEC: one parity per N chunks; rebuilds a single lost chunk per group |
 | `--fec-rs K:M`     | Reed-Solomon FEC: M parity per K chunks; rebuilds up to M losses per block (stronger, tunable) |
 | `--interleave`     | Spread FEC blocks across the transmission for burst-loss resilience (needs `--fec`/`--fec-rs`) |
 | `--compress`       | DEFLATE-compress the file before sending (fewer packets on the wire)   |
+| `--server-key <HEX\|FILE>` | Encrypt to this server public key (hex string or file); omit to send in the clear (see [Encryption](#encryption-optional)) |
 
 `--fec` and `--fec-rs` are mutually exclusive. XOR is cheapest and handles
 isolated losses; Reed-Solomon (`K:M`, with `K+M ≤ 256`) survives up to M losses
